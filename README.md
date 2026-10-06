@@ -19,18 +19,18 @@
 通过 [skills CLI](https://github.com/vercel-labs/skills) 一键安装到 Claude Code、Cursor、Codex 等 agent：
 
 ```bash
-npx skills add botiverse/wx-cli
+npx skills add ALHDLIOX/wx-cli
 ```
 
 或全局安装：
 
 ```bash
-npx skills add botiverse/wx-cli -g
+npx skills add ALHDLIOX/wx-cli -g
 ```
 
 安装后 agent 会自动读取 `SKILL.md`，了解如何安装和调用 wx-cli。
 
-源码与发布仓库：[botiverse/wx-cli](https://github.com/botiverse/wx-cli)。
+源码仓库：[ALHDLIOX/wx-cli](https://github.com/ALHDLIOX/wx-cli)（fork 自 botiverse/wx-cli，只在本 fork 上开发和推送）。
 
 ---
 
@@ -45,25 +45,41 @@ npx skills add botiverse/wx-cli -g
 
 ## 安装
 
-> **当前仓库 [botiverse/wx-cli](https://github.com/botiverse/wx-cli) 为 private。**  
-> 匿名 `curl` / 公开 npm 旧包（`@jackwener/wx-cli@0.3.0`）**拿不到**本仓库最新二进制。  
-> 有仓库读权限时，请用下面的 **源码构建**（推荐）。
+> 本 fork 目前**没有发布 Release 预编译包**，也不发布 npm 包，统一**从源码构建**。  
+> npm 上的历史包 `@jackwener/wx-cli` 是上游旧版本，不要用。
 
-### 从源码构建（推荐）
+### 1. 安装 Rust（只需一次）
 
 ```bash
-git clone git@github.com:botiverse/wx-cli.git && cd wx-cli
-cargo build --release
-# 安装到用户 PATH（覆盖旧版）
-mkdir -p ~/.local/bin
-cp target/release/wx ~/.local/bin/wx
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+source "$HOME/.cargo/env"
+cargo --version
+```
+
+### 2. 克隆并构建安装
+
+```bash
+git clone https://github.com/ALHDLIOX/wx-cli.git && cd wx-cli
+./install.sh   # 在仓库里运行时自动 cargo build --release，并装到 ~/.local/bin/wx（无需 sudo）
 wx --version   # 应显示当前 Cargo.toml 版本，如 0.6.3
 ```
+
+等价的手动步骤：
+
+```bash
+cargo build --release
+mkdir -p ~/.local/bin
+cp target/release/wx ~/.local/bin/wx
+```
+
+确保 `~/.local/bin` 在 `PATH` 里（zsh：`echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.zshrc`）。  
+想装到别的目录：`WX_INSTALL_DIR=/usr/local/bin ./install.sh`。  
+若 `sudo wx init` 提示 `command not found`（sudo 不认 `~/.local/bin`），改用 `sudo ~/.local/bin/wx init`。
 
 Windows：
 
 ```powershell
-git clone git@github.com:botiverse/wx-cli.git
+git clone https://github.com/ALHDLIOX/wx-cli.git
 cd wx-cli
 cargo build --release
 # 将 target\release\wx.exe 放到 PATH 目录
@@ -73,16 +89,13 @@ cargo build --release
 
 ```bash
 git pull
-cargo build --release
-cp target/release/wx ~/.local/bin/wx
+./install.sh
 ```
 
 <details>
-<summary>其他方式（需仓库权限 / 发布配置）</summary>
+<summary>Release 预编译包（本 fork 打 tag 发版后才可用）</summary>
 
-**GitHub Release 预编译包**（仓库 private 时仅协作者可见）
-
-从 [Releases](https://github.com/botiverse/wx-cli/releases) 下载：
+推送 `v*` tag 后 CI 会在 [Releases](https://github.com/ALHDLIOX/wx-cli/releases) 生成：
 
 | 平台 | 文件 |
 |------|------|
@@ -92,27 +105,11 @@ cp target/release/wx ~/.local/bin/wx
 | Linux arm64 | `wx-linux-arm64` |
 | Windows x86_64 | `wx-windows-x86_64.exe` |
 
-```bash
-chmod +x wx-macos-arm64 && mv wx-macos-arm64 ~/.local/bin/wx
-```
-
-**一键脚本**（raw 链接在 private 仓库下对匿名用户 404；有权限时可用 `gh` 下载 release asset）
+届时可以不 clone 直接一键安装：
 
 ```bash
-# 需已登录 gh 且对 botiverse/wx-cli 有读权限
-gh release download -R botiverse/wx-cli -p 'wx-macos-arm64' -O ~/.local/bin/wx
-chmod +x ~/.local/bin/wx
+curl -fsSL https://raw.githubusercontent.com/ALHDLIOX/wx-cli/main/install.sh | bash
 ```
-
-`install.sh` / `install.ps1` 仍维护在仓库内，仓库公开或 raw 可访问后可再启用：
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/botiverse/wx-cli/main/install.sh | bash
-```
-
-**npm**
-
-历史包名 `@jackwener/wx-cli` 仍存在于 npm，但公开 registry 上的版本可能严重滞后，**不要**当作当前主安装路径。
 
 </details>
 
@@ -412,7 +409,7 @@ macOS 取钥依赖本机 Terminal 的 `task_for_pid` / 调试能力，**与是�
 | 问题 | 处理 |
 |------|------|
 | `meta.unknown_shards` / doctor 缺关键分片 | `sudo wx key extract --hook-seconds 90`，等待时打开相关聊天 |
-| `wx --version` 偏旧 | `git pull && cargo build --release && cp target/release/wx ~/.local/bin/wx` |
+| `wx --version` 偏旧 | 在仓库目录 `git pull && ./install.sh` |
 | 是否必须关 SIP？ | **否** |
 | 是否必须 ad-hoc 重签微信？ | **默认否**；仅 SSH/无 GUI 且 attach 失败时考虑 |
 | daemon 无响应 | `wx daemon stop` 后任意查询会自动重启 |

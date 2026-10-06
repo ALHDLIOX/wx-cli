@@ -1,9 +1,9 @@
 # wx-cli Windows installer
-# Run with: irm https://raw.githubusercontent.com/botiverse/wx-cli/main/install.ps1 | iex
+# Run with: irm https://raw.githubusercontent.com/ALHDLIOX/wx-cli/main/install.ps1 | iex
 
 $ErrorActionPreference = "Stop"
 
-$Repo    = "botiverse/wx-cli"
+$Repo    = "ALHDLIOX/wx-cli"
 $BinName = "wx.exe"
 $Asset   = "wx-windows-x86_64.exe"
 $InstallDir = "$env:LOCALAPPDATA\wx-cli"

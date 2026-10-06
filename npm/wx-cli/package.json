@@ -34,7 +34,7 @@
   "license": "Apache-2.0",
   "repository": {
     "type": "git",
-    "url": "https://github.com/botiverse/wx-cli"
+    "url": "https://github.com/ALHDLIOX/wx-cli"
   },
   "publishConfig": {
     "access": "public"

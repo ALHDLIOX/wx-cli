@@ -36,28 +36,27 @@ description: "wx-cli — 从本地微信数据库查询聊天记录、联系人�
 
 ## 安装
 
-源码仓库：[botiverse/wx-cli](https://github.com/botiverse/wx-cli)（当前 **private**）。
+源码仓库：[ALHDLIOX/wx-cli](https://github.com/ALHDLIOX/wx-cli)（public fork，暂无 Release 预编译包，统一源码构建）。
 
-### 推荐：源码构建（需仓库读权限 + SSH）
+### 源码构建（需要 Rust：`cargo`）
 
 ```bash
-git clone git@github.com:botiverse/wx-cli.git && cd wx-cli
-cargo build --release
-mkdir -p ~/.local/bin && cp target/release/wx ~/.local/bin/wx
+# 没有 cargo 时先装：curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y && source "$HOME/.cargo/env"
+git clone https://github.com/ALHDLIOX/wx-cli.git && cd wx-cli
+./install.sh          # 自动 cargo build --release 并装到 ~/.local/bin/wx
 wx --version
 ```
 
 升级已有安装：
 
 ```bash
-cd /path/to/wx-cli && git pull && cargo build --release && cp target/release/wx ~/.local/bin/wx
+cd /path/to/wx-cli && git pull && ./install.sh
 ```
 
 ### 其他
 
-- 有 `gh` 权限时：`gh release download -R botiverse/wx-cli -p 'wx-macos-arm64' -O ~/.local/bin/wx`
-- **不要**依赖公开 npm `@jackwener/wx-cli`（registry 上可能是旧版本）
-- 匿名 curl `install.sh` 在 private 仓库下会 404
+- **不要**依赖公开 npm `@jackwener/wx-cli`（上游旧版本）
+- 本 fork 打 tag 发版后，才能用 `curl -fsSL https://raw.githubusercontent.com/ALHDLIOX/wx-cli/main/install.sh | bash` 免 clone 安装
 
 ---
 
