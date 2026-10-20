@@ -1,0 +1,13 @@
+[Unit]
+Description=Capture local WeChat FTS records
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 %h/.local/lib/wx-fts-collector/collector.py --library %h/.local/lib/wx-fts-collector/libsqlcipher.so
+Restart=on-failure
+RestartSec=5
+UMask=0077
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=default.target
