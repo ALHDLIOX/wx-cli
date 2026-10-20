@@ -1,4 +1,6 @@
 import sqlite3
+import hashlib
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -39,6 +41,33 @@ class CaptureTests(unittest.TestCase):
             self.assertEqual(dst.execute('SELECT count(*) FROM cursors').fetchone()[0],0)
             dst.execute('DROP TRIGGER fail')
             self.assertEqual(capture(src,dst,'account')['changed'],4)
+            dst.close()
+
+class PrimaryTests(unittest.TestCase):
+    def test_primary_only_message_and_binary_preservation(self):
+        src=FakeSource()
+        src.db.execute('DROP TABLE name2id')
+        src.db.execute('CREATE TABLE Name2Id(user_name TEXT)')
+        src.db.execute("INSERT INTO Name2Id VALUES ('filehelper')")
+        table='Msg_'+hashlib.md5(b'filehelper').hexdigest()
+        src.db.execute(f'CREATE TABLE {table}(local_id INTEGER PRIMARY KEY,sort_seq INTEGER,local_type INTEGER,server_id INTEGER,real_sender_id INTEGER,create_time INTEGER,message_content BLOB,WCDB_CT_message_content INTEGER)')
+        src.db.execute(f'INSERT INTO {table} VALUES (1,1,1,101,1,100,?,0)',('primary-only test',))
+        src.db.execute(f'INSERT INTO {table} VALUES (2,2,1,102,1,100,?,4)',(b'\x00\xff\x10',))
+        with tempfile.TemporaryDirectory() as d:
+            dst=archive(Path(d)/'archive.db')
+            self.assertEqual(capture(src,dst,'account',True,primary=True)['changed'],2)
+            payloads=[json.loads(x[0]) for x in dst.execute('SELECT payload FROM records ORDER BY source_rowid')]
+            self.assertEqual(payloads[0]['content'],'primary-only test')
+            self.assertEqual(payloads[0]['username'],'filehelper')
+            self.assertEqual(payloads[0]['source'],'message_primary')
+            self.assertEqual(payloads[1]['content_hex'],'00FF10')
+            self.assertIsNone(payloads[1]['content'])
+            self.assertFalse(payloads[1]['content_decoded'])
+            self.assertEqual(capture(src,dst,'account',primary=True)['changed'],0)
+            # A new table must be detected even with a previous shard cursor.
+            new='Msg_'+hashlib.md5(b'newchat').hexdigest()
+            src.db.execute(f'CREATE TABLE {new} AS SELECT * FROM {table} WHERE local_id=1')
+            self.assertEqual(capture(src,dst,'account',primary=True)['changed'],1)
             dst.close()
 
 if __name__=='__main__':unittest.main()

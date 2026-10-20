@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Read-only FTS capture. Index records are not complete chat history."""
+"""Read-only primary-message and FTS capture; only locally available records."""
 import argparse
 import ctypes as C
 import hashlib
@@ -101,27 +101,43 @@ def archive(path):
     return db
 
 
-def capture(src, dst, source_id, full=False):
-    tables = [r[0] for r in src.rows("SELECT name FROM sqlite_master WHERE type='table'") if TABLE.fullmatch(r[0])]
-    if not tables:
+def capture(src, dst, source_id, full=False, primary=False):
+    pattern = re.compile(r'Msg_[0-9a-f]{32}\Z') if primary else TABLE
+    tables = [r[0] for r in src.rows("SELECT name FROM sqlite_master WHERE type='table'") if pattern.fullmatch(r[0])]
+    if not tables and not primary:
         raise RuntimeError('unsupported FTS schema: no content tables')
-    names = dict(src.rows('SELECT rowid,username FROM name2id'))
+    names = dict(src.rows('SELECT rowid,user_name FROM Name2Id' if primary else 'SELECT rowid,username FROM name2id'))
+    table_users = {'Msg_'+hashlib.md5(u.encode()).hexdigest():u for u in names.values() if u}
+    columns = ('rowid,hex(message_content),local_id,sort_seq,local_type,server_id,real_sender_id,create_time,WCDB_CT_message_content'
+               if primary else 'rowid,c0,c1,c2,c3,c4,c5,c6')
     scanned = changed = 0
     for table in tables:
         old = dst.execute('SELECT rowid FROM cursors WHERE source=? AND table_name=?', (source_id, table)).fetchone()
         cursor = -1 if full or not old else old[0]
         while True:
-            rows = src.rows(f'SELECT rowid,c0,c1,c2,c3,c4,c5,c6 FROM "{table}" WHERE rowid>{int(cursor)} ORDER BY rowid LIMIT 500')
+            rows = src.rows(f'SELECT {columns} FROM "{table}" WHERE rowid>{int(cursor)} ORDER BY rowid LIMIT 500')
             if not rows:
                 break
             before = dst.total_changes
             # Archive rows and cursor together: a crash cannot advance past unsaved data.
             with dst:
-                for rid, content, local_id, seq, kind, session, sender, stamp in rows:
+                for row in rows:
+                    rid, content, local_id, seq, kind, session, sender, stamp = row[:8]
+                    extra = {}
+                    username = names.get(session)
+                    if primary:
+                        raw_hex = content
+                        ct = row[8]
+                        username = table_users.get(table)
+                        extra = dict(server_id=session, content_hex=raw_hex, compression=ct,
+                                     content_decoded=ct != 4)
+                        content = bytes.fromhex(raw_hex).decode('utf-8','replace') if ct != 4 else None
+                        session = table
                     payload = json.dumps(dict(content=content, local_id=local_id, sort_seq=seq,
-                        type_code=kind, session_id=session, username=names.get(session),
+                        type_code=kind, session_id=session, username=username,
                         sender_id=sender, sender=names.get(sender), timestamp=stamp,
-                        source='message_fts'), ensure_ascii=False, sort_keys=True)
+                        source='message_primary' if primary else 'message_fts', **extra),
+                        ensure_ascii=False, sort_keys=True)
                     identity = hashlib.sha256(json.dumps([rid,local_id,seq,session,stamp]).encode()).hexdigest()
                     now = time.time()
                     dst.execute('''INSERT INTO records VALUES (?,?,?,?,?,?,?)
@@ -161,21 +177,38 @@ def main():
         try:
             cfg = json.loads(args.config.read_text())
             keys = json.loads(Path(cfg['keys_file']).read_text())
-            key = keys[REL]; key = key if isinstance(key,str) else key['enc_key']
-            path = Path(cfg['db_dir'])/REL
-            with path.open('rb') as f:
-                salt = f.read(16)
-            source_id = hashlib.sha256(os.fsencode(path.resolve())+salt).hexdigest()
-            src = Source(args.library, path, key)
-            src.rows('BEGIN')
             full = start - full_at >= 60
-            result = capture(src, dst, source_id, full)
-            if full:
+            rels = sorted(k for k in keys if k == REL or re.fullmatch(r'message/message_\d+\.db', k))
+            discovered = {str(p.relative_to(cfg['db_dir'])) for p in Path(cfg['db_dir']).glob('message/message_*.db')
+                          if p.name == 'message_fts.db' or re.fullmatch(r'message_\d+\.db',p.name)}
+            unknown = sorted(discovered-set(rels))
+            result = dict(scanned=0, changed=0, tables=0, sources={}, unknown_shards=unknown)
+            for rel in rels:
+                try:
+                    key = keys[rel]; key = key if isinstance(key,str) else key['enc_key']
+                    path = Path(cfg['db_dir'])/rel
+                    with path.open('rb') as f:
+                        salt = f.read(16)
+                    source_id = hashlib.sha256(os.fsencode(path.resolve())+salt).hexdigest()
+                    src = Source(args.library, path, key)
+                    src.rows('BEGIN')
+                    part = capture(src, dst, source_id, full, primary=rel != REL)
+                    for field in ('scanned','changed','tables'):
+                        result[field] += part[field]
+                    part.update(status='ok', source_latest_write=max(q.stat().st_mtime
+                        for q in (path,Path(str(path)+'-wal')) if q.exists()))
+                    result['sources'][rel] = part
+                except Exception as e:
+                    result['sources'][rel] = dict(status='error', error_type=type(e).__name__)
+                finally:
+                    if src:
+                        src.close(); src = None
+            good = bool(rels) and not unknown and all(x['status']=='ok' for x in result['sources'].values())
+            if full and good:
                 full_at = start
-            result.update(status='ok', checked_at=time.time(), full_scan=full,
+            result.update(status='ok' if good else 'partial_error', checked_at=time.time(), full_scan=full,
                 total_records=dst.execute('SELECT count(*) FROM records').fetchone()[0],
-                scope='local FTS index only', poll_seconds=args.poll,
-                source_latest_write=max(q.stat().st_mtime for q in (path, Path(str(path)+'-wal')) if q.exists()))
+                scope='local primary messages and FTS index; source rows are distinct', poll_seconds=args.poll)
         except Exception as e:
             # Never put source paths, keys or chat content in journal/status errors.
             result = dict(status='error', checked_at=time.time(), error_type=type(e).__name__)
