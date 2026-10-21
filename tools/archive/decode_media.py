@@ -33,14 +33,14 @@ def validated(data):
 
 def run(root,out,manifest,key,xor):
     os.umask(0o077);out.mkdir(parents=True,exist_ok=True)
-    db=sqlite3.connect(manifest);db.execute('CREATE TABLE IF NOT EXISTS decoded(path TEXT PRIMARY KEY,size INTEGER,mtime INTEGER,status TEXT,output TEXT,sha256 TEXT)')
-    counts=collections.Counter();start=time.time()
+    db=sqlite3.connect(manifest,timeout=180);db.execute("PRAGMA journal_mode=WAL");db.execute('CREATE TABLE IF NOT EXISTS decoded(path TEXT PRIMARY KEY,size INTEGER,mtime INTEGER,status TEXT,output TEXT,sha256 TEXT)')
+    existing={r[0]:r[1:] for r in db.execute('SELECT path,size,mtime,status,output FROM decoded')};counts=collections.Counter();start=time.time()
     for parent,dirs,files in os.walk(root):
         dirs[:]=[d for d in dirs if not (Path(parent)/d).is_symlink()]
         for name in files:
             p=Path(parent)/name
             if p.suffix.lower()!='.dat' or p.is_symlink():continue
-            st=p.stat();rel=str(p.relative_to(root));old=db.execute('SELECT size,mtime,status,output FROM decoded WHERE path=?',(rel,)).fetchone()
+            st=p.stat();rel=str(p.relative_to(root));old=existing.get(rel)
             if old and old[:2]==(st.st_size,st.st_mtime_ns) and (old[2]!='ok' or (out/old[3]).exists()):counts[old[2]]+=1;continue
             dest=None;sha=None
             try:
@@ -52,8 +52,8 @@ def run(root,out,manifest,key,xor):
                 sha=hashlib.sha256(data).hexdigest();status='ok'
             except Exception as e:status=str(e) if isinstance(e,ValueError) and str(e) in {'wxgf_needs_conversion','missing_key','unknown_format','invalid_padding','invalid_lengths','invalid_plain_length','truncated_header','oversize','source_changed'} else type(e).__name__
             db.execute('INSERT OR REPLACE INTO decoded VALUES (?,?,?,?,?,?)',(rel,st.st_size,st.st_mtime_ns,status,str(dest) if dest else None,sha));counts[status]+=1
-            if sum(counts.values())%200==0:
-                db.commit();Path(str(manifest)+'.status.json').write_text(json.dumps({'stage':'running','counts':counts,'at':time.time(),'started':start}))
+            if sum(counts.values())%20==0:
+                db.commit();time.sleep(0.02);Path(str(manifest)+'.status.json').write_text(json.dumps({'stage':'running','counts':counts,'at':time.time(),'started':start}))
     db.commit();db.close();report={'stage':'complete','counts':counts,'at':time.time(),'started':start};Path(str(manifest)+'.status.json').write_text(json.dumps(report));print(json.dumps(report))
 
 if __name__=='__main__':

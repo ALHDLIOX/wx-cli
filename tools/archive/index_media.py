@@ -3,7 +3,7 @@
 import argparse,sqlite3,os,json
 from pathlib import Path
 p=argparse.ArgumentParser(description=__doc__);p.add_argument('--media',type=Path,required=True);p.add_argument('--db',type=Path,required=True);a=p.parse_args();os.umask(0o077)
-c=sqlite3.connect(a.db);count=size=0
+c=sqlite3.connect(a.db,timeout=180);count=size=0
 with c:
  for parent,dirs,files in os.walk(a.media):
   for name in files:
