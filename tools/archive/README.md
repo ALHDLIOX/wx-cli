@@ -65,3 +65,45 @@ message counts, index evidence, decoding failures, and unresolved identities.
 
 Use `search-index TEXT` to query the separately labeled index evidence. It is not
 merged into the main history and may contain partial text or duplicate messages.
+
+## Incremental Mac to NAS collection
+
+`sync_incremental.py --state-dir PRIVATE_STATE --once` reads live encrypted
+primary shards using the existing local SQLCipher library and keys. The private
+state file identifies the previously verified plaintext snapshot and account.
+Initial row cursors come from that snapshot; new shards start at row zero.
+A recent row tail is replayed, so same-second messages are not skipped. A local
+payload fingerprint avoids repeatedly uploading unchanged rows. NAS commits an
+idempotent batch before the Mac advances its cursors. Changed source payloads
+are retained in `incremental_edits`; arbitrary edits to older rows outside the
+replay tail and deleted messages are not fully reconciled. Salt changes or rowid
+resets stop collection explicitly. Keys and message payloads must never enter Git.
+The deployment polls messages every minute while the Mac user session is active;
+sleep/offline periods delay collection until a subsequent successful run.
+
+`decode_media.py` validates decoded DAT images with Pillow before publishing a
+separate output file. It takes image key material on stdin, and keeps a resumable
+SQLite manifest. The output hash describes decoded bytes, not the encrypted input.
+`convert_wxgf.py` converts a dominant HEVC partition through FFmpeg; ambiguous
+multi-partition animations stay unresolved rather than being called complete.
+This uses the partition layout documented in
+[chatlog](https://github.com/sjzar/chatlog/blob/a16b689/pkg/util/dat2img/wxgf.go).
+
+`link_media.py` writes a separate association database. A link requires an exact
+MD5 reference in message XML plus the corresponding conversation directory.
+`no_extractable_reference` is unknown coverage, not a missing-file assertion.
+Original filenames, thumbnails, and full images are retained separately.
+Media sync and indexing run independently from text; their refresh interval and
+backlogs can make attachment availability later than message availability.
+
+Additional media tests require `cryptography` and `Pillow` in an isolated venv.
+
+For this deployment, launch agents run `sync_incremental.py` and
+`recent_media.py` every 60 seconds. The latter prioritizes up to 20 recent image
+files per run, checks transfer hashes, and validates decoded output on NAS.
+A separate 15-minute media sweep catches other attachments and older local files.
+These are polling intervals, not guaranteed end-to-end latency. Backfills, sleep,
+missing downloads, connection failures, or image formats needing further work
+can delay availability. `attachments --message-id ID` on `query_archive.py`
+returns association evidence and decoded/original paths once indexed. Voice
+conversion and arbitrary older historical edits are outside these new workers.
