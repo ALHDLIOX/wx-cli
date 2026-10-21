@@ -375,7 +375,7 @@ CREATE TABLE chatroom_member(room_id INTEGER,member_id INTEGER);
                     self.assertEqual((vault / 'media/msg' / rel).read_bytes(), b'bytes')
                     self.assertIsNotNone(db.execute('SELECT path FROM media_files WHERE path=?', ('msg/' + rel,)).fetchone())
 
-    def test_unparseable_source_variant_preserves_original_files(self):
+    def test_unparseable_source_variant_checks_each_original_file(self):
         bodies = ['PRIVATE malformed variant', '<msg><appmsg>',
                   app('exclusive.bin').replace('<totallen>5</totallen>', '<totallen>unknown</totallen>')]
         for body in bodies:
@@ -391,18 +391,21 @@ CREATE TABLE chatroom_member(room_id INTEGER,member_id INTEGER);
                 before = tree_state(vault)
                 plan = execute(vault, exclude)
                 self.assertEqual(tree_state(vault), before)
-                self.assertFalse(any(item['path'].startswith('media/msg/file/') for item in plan['files']))
-                self.assertEqual(plan['exclusion_unresolved'], 3)
+                retained = 'exclusive.bin' in body
+                self.assertEqual('media/msg/file/2026-01/exclusive.bin' in
+                                 {item['path'] for item in plan['files']}, not retained)
+                self.assertEqual(plan['exclusion_unresolved'], 1)
                 self.assertNotIn('PRIVATE', json.dumps(plan))
                 with patch('purge_conversations.os.geteuid', return_value=0):
                     result = execute(vault, exclude, True, plan['plan_digest'], no_process)
                 self.assertNotIn('PRIVATE', json.dumps(result))
-                self.assertTrue((vault / 'media/msg/file/2026-01/exclusive.bin').is_file())
+                self.assertEqual((vault / 'media/msg/file/2026-01/exclusive.bin').is_file(), retained)
                 with closing(sqlite3.connect(archive)) as db:
-                    self.assertIsNotNone(db.execute('SELECT path FROM media_files WHERE path=?',
-                                                   ('msg/file/2026-01/exclusive.bin',)).fetchone())
+                    indexed = db.execute('SELECT path FROM media_files WHERE path=?',
+                                         ('msg/file/2026-01/exclusive.bin',)).fetchone()
+                    self.assertEqual(indexed is not None, retained)
 
-    def test_unreadable_edit_preserves_original_files(self):
+    def test_unreadable_edit_checks_each_original_file(self):
         row = message_row(KEPT, 49, app('exclusive.bin'), 4)
         payloads = ['PRIVATE invalid JSON', json.dumps([]), json.dumps({'kind': 49}),
                     json.dumps(dict(row, content_hex='invalid hex')),
@@ -422,12 +425,32 @@ CREATE TABLE chatroom_member(room_id INTEGER,member_id INTEGER);
                 before = tree_state(vault)
                 plan = execute(vault, exclude)
                 self.assertEqual(before, tree_state(vault))
-                self.assertFalse(any(item['path'].startswith('media/msg/file/') for item in plan['files']))
-                self.assertEqual(plan['exclusion_unresolved'], 3)
+                # A decoded malformed XML without this filename is unrelated.
+                retained = payload != payloads[-1]
+                self.assertEqual('media/msg/file/2026-01/exclusive.bin' in
+                                 {item['path'] for item in plan['files']}, not retained)
+                self.assertEqual(plan['exclusion_unresolved'], 2 if retained else 1)
                 self.assertNotIn('PRIVATE', json.dumps(plan))
                 with patch('purge_conversations.os.geteuid', return_value=0):
                     execute(vault, exclude, True, plan['plan_digest'], no_process)
-                self.assertTrue((vault / 'media/msg/file/2026-01/exclusive.bin').is_file())
+                self.assertEqual((vault / 'media/msg/file/2026-01/exclusive.bin').is_file(), retained)
+
+    def test_excluded_unreadable_edits_do_not_block_file_exclusion(self):
+        row = message_row(EXCLUDED, 49, app('exclusive.bin'), 4)
+        payloads = [dict(row, content_hex='invalid hex'), dict(row, content_hex='ff'),
+                    dict(row, compression=None), dict(row, kind='49')]
+        for payload in payloads:
+            with self.subTest(payload=payload), tempfile.TemporaryDirectory() as tmp:
+                vault, exclude, _, _ = fixture(Path(tmp))
+                archive = vault / 'structured/chat-archive.sqlite3'
+                with closing(sqlite3.connect(archive)) as db:
+                    db.execute('UPDATE incremental_edits SET payload_json=? WHERE source_table=?',
+                               (json.dumps(payload), 'Msg_' + chat_hash(EXCLUDED)))
+                    db.commit()
+                plan = execute(vault, exclude)
+                self.assertIn('media/msg/file/2026-01/exclusive.bin',
+                              {item['path'] for item in plan['files']})
+                self.assertEqual(plan['exclusion_unresolved'], 1)
 
     def test_primary_unresolved_conversation_is_completely_removed(self):
         with tempfile.TemporaryDirectory() as tmp:

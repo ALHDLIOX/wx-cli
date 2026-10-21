@@ -10,6 +10,7 @@ from pathlib import Path
 import re
 import stat
 import xml.etree.ElementTree as ET
+from xml.sax.saxutils import escape
 
 TOKEN = re.compile(rb'[0-9a-fA-F]{32}')
 MESSAGE_TABLE = re.compile(r'Msg_[0-9a-f]{32}\Z')
@@ -57,7 +58,7 @@ class Ownership:
         self.tables = {'Msg_' + value for value in self.hashes}
         self.token_owners = defaultdict(set)
         self.file_owners = defaultdict(set)
-        self.files_complete = True
+        self.failed_messages = []
 
     def add_tokens(self, user, raw):
         for token in tokens(raw):
@@ -65,12 +66,12 @@ class Ownership:
 
     def add_message(self, user, text, decoded=True):
         if not decoded or text is None:
-            self.files_complete = False
+            self.failed_messages.append((user, None))
             return
         self.add_tokens(user, text)
         # Only actual file appmsgs supply a reliable original name + byte size.
         if len(text) > 8 * 1024 * 1024 or '<!DOCTYPE' in text.upper() or '<!ENTITY' in text.upper():
-            self.files_complete = False
+            self.failed_messages.append((user, text))
             return
         try:
             element = ET.fromstring(text[text.index('<'):])
@@ -80,12 +81,12 @@ class Ownership:
             title = app.findtext('title')
             size = int(app.findtext('.//totallen'))
             if not title or Path(title).name != title or size < 0:
-                self.files_complete = False
+                self.failed_messages.append((user, text))
                 return
             self.file_owners[(title, size)].add(user)
         except (ET.ParseError, ValueError, TypeError):
             # A malformed appmsg may hide another reference to the same file.
-            self.files_complete = False
+            self.failed_messages.append((user, text))
 
     def exclusive(self, owners):
         return bool(owners) and owners <= self.excluded
@@ -102,9 +103,21 @@ class Ownership:
                 return 'exclude'
         if parts and parts[0] == 'file':
             owners = self.file_owners.get((parts[-1], size), set())
-            if not owners or not self.files_complete:
+            if not owners:
                 return 'unresolved'
-            return 'exclude' if self.exclusive(owners) else 'keep'
+            if not self.exclusive(owners):
+                return 'keep'
+            # Only exclusive candidates need the more expensive fallback scan.
+            names = {parts[-1], escape(parts[-1])}
+            undecodable = False
+            for user, text in self.failed_messages:
+                if user in self.excluded:
+                    continue
+                if text is None:
+                    undecodable = True
+                elif any(name in text for name in names):
+                    return 'keep'
+            return 'unresolved' if undecodable else 'exclude'
         return 'keep'
 
     def collect_resources(self, rows):
