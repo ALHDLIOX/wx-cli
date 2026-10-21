@@ -4,6 +4,7 @@ Key JSON is read from stdin, never logged. Requires cryptography and Pillow.
 """
 import argparse,collections,hashlib,io,json,os,sqlite3,struct,sys,time
 from pathlib import Path
+from archive_state import atomic_json, file_lock
 from cryptography.hazmat.primitives.ciphers import Cipher,algorithms,modes
 from PIL import Image
 
@@ -32,6 +33,10 @@ def validated(data):
     return {'jpeg':'jpg','tiff':'tif'}.get(fmt,fmt)
 
 def run(root,out,manifest,key,xor):
+    with file_lock(Path(manifest).parent/'media-transfer.lock',shared=True):
+        return _run(root,out,manifest,key,xor)
+
+def _run(root,out,manifest,key,xor):
     os.umask(0o077);out.mkdir(parents=True,exist_ok=True)
     db=sqlite3.connect(manifest,timeout=180);db.execute("PRAGMA journal_mode=WAL");db.execute('CREATE TABLE IF NOT EXISTS decoded(path TEXT PRIMARY KEY,size INTEGER,mtime INTEGER,status TEXT,output TEXT,sha256 TEXT)')
     existing={r[0]:r[1:] for r in db.execute('SELECT path,size,mtime,status,output FROM decoded')};counts=collections.Counter();start=time.time()
@@ -53,8 +58,8 @@ def run(root,out,manifest,key,xor):
             except Exception as e:status=str(e) if isinstance(e,ValueError) and str(e) in {'wxgf_needs_conversion','missing_key','unknown_format','invalid_padding','invalid_lengths','invalid_plain_length','truncated_header','oversize','source_changed'} else type(e).__name__
             db.execute('INSERT OR REPLACE INTO decoded VALUES (?,?,?,?,?,?)',(rel,st.st_size,st.st_mtime_ns,status,str(dest) if dest else None,sha));counts[status]+=1
             if sum(counts.values())%20==0:
-                db.commit();time.sleep(0.02);Path(str(manifest)+'.status.json').write_text(json.dumps({'stage':'running','counts':counts,'at':time.time(),'started':start}))
-    db.commit();db.close();report={'stage':'complete','counts':counts,'at':time.time(),'started':start};Path(str(manifest)+'.status.json').write_text(json.dumps(report));print(json.dumps(report))
+                db.commit();time.sleep(0.02);atomic_json(Path(str(manifest)+'.status.json'),{'stage':'running','counts':counts,'at':time.time(),'started':start})
+    db.commit();db.close();report={'stage':'complete','counts':counts,'at':time.time(),'started':start};atomic_json(Path(str(manifest)+'.status.json'),report);print(json.dumps(report))
 
 if __name__=='__main__':
     p=argparse.ArgumentParser();p.add_argument('--root',type=Path,required=True);p.add_argument('--output',type=Path,required=True);p.add_argument('--manifest',type=Path,required=True);a=p.parse_args()

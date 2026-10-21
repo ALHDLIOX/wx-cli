@@ -1,0 +1,10 @@
+[Unit]
+Description=Check WeChat archive Mac heartbeat every five minutes
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=5min
+Unit=wechat-archive-heartbeat.service
+
+[Install]
+WantedBy=timers.target
