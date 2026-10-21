@@ -294,21 +294,26 @@ def collect_archive(db, ownership):
     if 'incremental_edits' in available:
         decoder = Decoder()
         for (payload,) in db.execute('SELECT payload_json FROM incremental_edits'):
+            user = None
             try:
                 row = json.loads(payload)
-                if not isinstance(row, dict) or type(row['kind']) is not int:
+                if not isinstance(row, dict):
+                    raise ValueError()
+                candidate = row.get('conversation')
+                if isinstance(candidate, str) and candidate:
+                    user = candidate
+                if type(row['kind']) is not int:
                     raise ValueError()
                 if (row['kind'] & 0xffffffff) not in (3, 43, 49, 62):
                     continue
-                user = row['conversation']
-                if not isinstance(user, str) or not user or type(row['compression']) is not int:
+                if user is None or type(row['compression']) is not int:
                     raise ValueError()
                 raw = bytes.fromhex(row['content_hex'])
                 body, status = decoder.decode(raw, row['compression'])
             except (KeyError, ValueError, TypeError):
                 # An unreadable edit may be a retained conversation's new file
                 # reference. It cannot authorize deleting any original name.
-                ownership.files_complete = False
+                ownership.add_message(user, None, decoded=False)
                 continue
             ownership.add_message(user, body, status in ('ok', 'empty'))
 

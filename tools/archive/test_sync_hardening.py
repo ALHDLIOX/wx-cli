@@ -104,6 +104,45 @@ class ExclusionTests(unittest.TestCase):
         own.add_message(KEPT, None, False)
         self.assertEqual(own.decision('file/2026-01/exclusive.bin', 5), 'unresolved')
 
+    def test_failed_messages_are_checked_per_file(self):
+        cases = [
+            ('unrelated plain text', KEPT, 'unrelated message', True, 'exclude'),
+            ('unrelated XML', KEPT, '<msg><appmsg>', True, 'exclude'),
+            ('matching plain text', KEPT, 'file a&b.bin', True, 'keep'),
+            ('matching escaped XML', KEPT, '<msg><title>a&amp;b.bin</title>', True, 'keep'),
+            ('invalid size', KEPT, '<appmsg><type>6</type><title>a&amp;b.bin</title>'
+             '<totallen>bad</totallen></appmsg>', True, 'keep'),
+            ('invalid title', KEPT, '<appmsg><type>6</type><title>../a&amp;b.bin</title>'
+             '<totallen>5</totallen></appmsg>', True, 'keep'),
+            ('unsafe XML', KEPT, '<!DOCTYPE msg><msg>a&amp;b.bin</msg>', True, 'keep'),
+            ('undecodable', KEPT, None, False, 'unresolved'),
+            ('failed decode with text', KEPT, 'unreliable text', False, 'unresolved'),
+            ('excluded matching', EXCLUDED, 'file a&b.bin', True, 'exclude'),
+            ('excluded undecodable', EXCLUDED, None, False, 'exclude'),
+        ]
+        for label, user, text, decoded, expected in cases:
+            with self.subTest(label=label):
+                own = Ownership({EXCLUDED})
+                own.add_message(EXCLUDED, '<appmsg><type>6</type><title>a&amp;b.bin</title>'
+                                '<totallen>5</totallen></appmsg>')
+                own.add_message(user, text, decoded)
+                self.assertEqual(own.failed_messages, [(user, text if decoded else None)])
+                self.assertEqual(own.decision('file/2026-01/a&b.bin', 5), expected)
+                self.assertEqual(own.decision('file/2026-01/unknown.bin', 5), 'unresolved')
+                own.add_message(KEPT, '<appmsg><type>6</type><title>a&amp;b.bin</title>'
+                                '<totallen>5</totallen></appmsg>')
+                self.assertEqual(own.decision('file/2026-01/a&b.bin', 5), 'keep')
+
+    def test_matching_failure_takes_precedence_over_undecodable(self):
+        for users in ((None, 'exclusive.bin'), ('exclusive.bin', None)):
+            with self.subTest(order=users):
+                own = Ownership({EXCLUDED})
+                own.add_message(EXCLUDED, '<appmsg><type>6</type><title>exclusive.bin</title>'
+                                '<totallen>5</totallen></appmsg>')
+                for text in users:
+                    own.add_message(KEPT, text)
+                self.assertEqual(own.decision('file/exclusive.bin', 5), 'keep')
+
 
 class WorkerTests(unittest.TestCase):
     def test_atomic_state_failure_preserves_success_and_redacts(self):
@@ -267,10 +306,14 @@ class WorkerTests(unittest.TestCase):
             own = Ownership({EXCLUDED})
             own.add_tokens(EXCLUDED, b'a' * 32)
             own.add_tokens(KEPT, b'b' * 32)
+            own.add_message(EXCLUDED, '<appmsg><type>6</type><title>exclusive.bin</title>'
+                            '<totallen>7</totallen></appmsg>')
+            own.add_message(KEPT, '<msg><appmsg>unrelated broken XML')
             for rel in ('attach/' + chat_hash(EXCLUDED) + '/2026-01/Img/x.dat',
                         'attach/' + chat_hash(KEPT) + '/2026-01/Img/y.dat',
                         'video/2026-01/' + 'a' * 32 + '.mp4',
-                        'video/2026-01/' + 'b' * 32 + '.mp4', 'file/2026-01/unknown.bin'):
+                        'video/2026-01/' + 'b' * 32 + '.mp4', 'file/2026-01/unknown.bin',
+                        'file/2026-01/exclusive.bin'):
                 path = account / 'msg' / rel
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_bytes(b'fixture')
@@ -281,6 +324,7 @@ class WorkerTests(unittest.TestCase):
                     result = fast_sync.run(state)
             pending = json.loads((state / 'fast-pending.json').read_text())
             self.assertEqual(len(pending), 3)
+            self.assertNotIn('file/2026-01/exclusive.bin', pending)
             self.assertFalse(any(chat_hash(EXCLUDED) in path for path in pending))
             self.assertEqual(result['exclusion_unresolved'], 1)
 
