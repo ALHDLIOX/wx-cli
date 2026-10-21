@@ -16,6 +16,7 @@ import re
 import sqlite3
 import time
 import xml.etree.ElementTree as ET
+from archive_state import atomic_json
 
 MSG = re.compile(r'Msg_[0-9a-f]{32}$')
 TYPES = {1:'text',3:'image',34:'voice',42:'contact_card',43:'video',47:'sticker',48:'location',49:'app_message',50:'call',62:'short_video',10000:'system',10002:'system_event'}
@@ -208,7 +209,7 @@ UPDATE conversations SET message_count=(SELECT count(*) FROM messages m WHERE m.
         self.db.execute('PRAGMA wal_checkpoint(TRUNCATE)')
         self.db.execute('PRAGMA journal_mode=DELETE')
         self.db.close()
-        self.output.chmod(0o600);self.output.with_suffix('.report.json').write_text(json.dumps(report,ensure_ascii=False,indent=2));print(json.dumps(report,ensure_ascii=False),flush=True);return report
+        self.output.chmod(0o600);atomic_json(self.output.with_suffix('.report.json'),report);print(json.dumps(report,ensure_ascii=False),flush=True);return report
     def run(self):
         self.contacts();self.primary();self.unsupported();self.auxiliary();return self.finish()
 

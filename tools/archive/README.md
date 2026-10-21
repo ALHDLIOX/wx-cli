@@ -98,8 +98,8 @@ backlogs can make attachment availability later than message availability.
 
 Additional media tests require `cryptography` and `Pillow` in an isolated venv.
 
-For this deployment, launch agents run `sync_incremental.py` and
-`recent_media.py` every 60 seconds. The latter prioritizes up to 20 recent image
+For this deployment, the persistent supervisor calls `sync_incremental.cycle` and
+`recent_media.main` every 60 seconds. The latter prioritizes up to 20 recent image
 files per run, checks transfer hashes, and validates decoded output on NAS.
 A separate 15-minute media sweep catches other attachments and older local files.
 These are polling intervals, not guaranteed end-to-end latency. Backfills, sleep,
@@ -115,8 +115,9 @@ command-line interpreter to open another application's container can repeatedly
 trigger macOS cross-app privacy prompts. `macos/Launcher.swift` supplies a stable,
 locally signed application identity, `WeChat NAS Sync.app`, which starts
 `macos/supervisor.py` once. Three worker threads perform text, recent image, and
-full-media work in that same Python process. The media scanner also executes in
-process; SSH workers do not open the Mac's WeChat container.
+full-media work in that same Python process. The supervisor directly imports the media orchestrator and scanner from this
+checkout. Each worker releases its file lock at the end of every round, including
+failed rounds. SSH workers do not open the Mac's WeChat container.
 
 The user must explicitly enable Full Disk Access for this dedicated app in System
 Settings; do not edit TCC, grant broad access to a general Python interpreter, or
@@ -132,3 +133,142 @@ in `~/.wx-cli/nas-archive/supervisor-config.json` supplies the interpreter, repo
 and supervisor paths. Do not replace the app's executable/signature casually after
 authorization. This application is not sandboxed: Full Disk Access is a broader
 OS permission than the particular WeChat paths used by these scripts.
+
+
+## Mac 排除名单与状态
+
+仅在私有状态目录 `~/.wx-cli/nas-archive/exclude.json` 中保存名单，不加入 Git，
+权限必须为 `0600`（目录为 `0700`）。下面均为示例占位值，实际 username 由人工填写：
+
+```json
+{"version": 1, "conversations": {"example_group@chatroom": "示例备注", "wxid_example": "示例备注"}}
+```
+
+每轮都会重新读取。不存在的文件表示空名单；JSON、版本、字段类型或权限不正确时，
+这一轮报错且不上传。建议在同目录写好临时文件、`chmod 600` 后再 `mv` 替换名单。
+名单和备注不会随同步包发送。
+
+- 文字同步在读取消息表、检查会话解析和写游标之前跳过 `Msg_<md5(username)>`；
+  资源引用按 `ChatName2Id` 过滤。近期图片也跳过排除会话的引用和附件目录。
+- 全量媒体跳过整个 `msg/attach/<md5(username)>/`。视频和缩略图只有在其 token
+  的全部已知引用均属于排除会话时才跳过；另一会话也引用的 token 会保留。
+- `msg/file/YYYY-MM/` 原始文件按文件类 appmsg（type 6）的 `title` 和 `totallen`
+  匹配文件名与字节数，并检查所有会话的引用。共享文件照常同步；缺少可靠证据、
+  存在无法解码的相关记录或无法解析的 appmsg 时保留，记入 `exclusion_unresolved`。
+  NAS 清除使用同一个 `exclusion.py`，合并归档及所有快照的证据后判断；归档中的
+  `incremental_edits` 也会解码并参与判断；新来源合并到已有消息时留下的
+  `message_sources.variant_text` 同样参与文件和视频归属判断，避免快照及规范正文遗漏
+  编辑或来源变体中的共享引用。编辑证据损坏、缺字段、无法解码，或正文及来源变体的
+  appmsg 无法解析时，保守保留原名文件。
+
+名单控制此后的上传，已有 NAS 数据需要另行清除。移除名单中的会话后，原来未写入的
+文字游标可继续补传，媒体也会重新参与扫描。
+
+三个 worker 的状态为 `incremental-status.json`、`recent-media-status.json`、
+`media-cycle-status.json`，同时保留 supervisor 状态文件。每个状态包含 `stage`、
+`last_success_at`、`consecutive_errors`；失败时包含 `error_type` 和至多 200 字符的
+`error_summary`。成功时间在失败时保留，成功后清零连续失败次数。
+错误摘要仅允许异常类型及受控的首行错误码，任意异常原文不写入状态或告警，避免
+SQL、聊天正文、密钥或远端 payload 混入诊断。状态、计划和待发送包均先写私有临时文件
+再原子替换；SQLite 游标使用事务，NAS 确认提交后才推进。
+
+文字 worker 每轮执行 `/usr/bin/pgrep -x WeChat`，返回 0 时 `wechat_running=true`；
+微信未运行时仍正常同步。每包（包括空包）携带 `mac_status`，仅含三个 worker 的
+`stage/last_success_at/consecutive_errors/error_type/error_summary` 和微信运行状态。
+`supervisor-config.json` 继续使用 `repository`、`python`、`supervisor` 三个字段；
+`macos/supervisor.py` 的位置不变，无需修改、重编译或重新签名 `Launcher.swift`。
+
+## NAS 心跳安装（由人工执行）
+
+仓库仅提供 unit/timer 文件。先把更新后的 `tools/archive/` 下 Python 文件复制到
+`vault/tools/`，保留 `macos/`、`nas/` 子目录，包含共享的 `archive_state.py` 和
+`exclusion.py`；已有 ingest/decode/link/index 的命令行参数保持原样。
+下文 `vault` 为 `/pool-safe/wechat-vault`。
+
+1. 人工创建 `vault/heartbeat-config.json`，权限 `0600`，填入真实 target；不要将真实值
+   写入仓库。`stale_minutes`、`error_threshold` 可省略，默认分别为 60 和 5。
+
+   ```json
+   {"target": "weixin:<id>", "stale_minutes": 60, "error_threshold": 5}
+   ```
+
+2. 确认 root 运行环境的 PATH 中能找到 `hermes`，并已由人工配置发送权限。
+3. 复制并启用定时器（这些命令不会由本工单自动执行）：
+
+   ```sh
+   cp /pool-safe/wechat-vault/tools/nas/wechat-archive-heartbeat.service /etc/systemd/system/
+   cp /pool-safe/wechat-vault/tools/nas/wechat-archive-heartbeat.timer /etc/systemd/system/
+   systemctl daemon-reload
+   systemctl enable --now wechat-archive-heartbeat.timer
+   systemctl list-timers wechat-archive-heartbeat.timer
+   ```
+
+`ingest_delta.py` 使用 `<archive>.ingest.lock`，每次调用原子写入
+`vault/mac-heartbeat.json` 的 `received_at` 与 `mac_status`，兼容没有状态字段的旧包。
+定时器每 5 分钟检查一次：超时告警“Mac 同步已中断 N 分钟”，微信未运行告警一次，
+任一 worker 连续失败达到阈值时告警并注明 worker 名和安全错误摘要。
+同一条件持续时只告警一次，恢复时通知“已恢复”及中断分钟数；旧包缺少的状态不推断为恢复。
+去重状态为私有、原子写入的 `heartbeat-state.json`。`hermes send -t TARGET -q 文本`
+使用参数列表执行，任何一次发送失败都不更新本轮去重状态，下轮重试。
+
+## NAS 历史清除（由人工执行）
+
+**顺序必须是：先在 Mac 部署排除名单并确认新 worker 已生效，再复制名单到 NAS dry-run，
+最后 apply。** 更新后应重启原有 app 的 Python 进程以载入代码，保持 app 签名与完全磁盘访问
+授权不变；确认一轮文字、近期图片及全量媒体状态成功并核对私有待传计划。
+不按此顺序，全量媒体的 NAS 对比会将已删除文件重新上传。
+
+在 NAS 上用 root 执行，名单文件权限仍为 `0600`：
+
+```sh
+python3 /pool-safe/wechat-vault/tools/purge_conversations.py \
+  --vault /pool-safe/wechat-vault --exclude /private/exclude.json
+# 核对各路径的行数、文件数、字节数，以及 plan_digest 后再执行：
+python3 /pool-safe/wechat-vault/tools/purge_conversations.py \
+  --vault /pool-safe/wechat-vault --exclude /private/exclude.json \
+  --apply --confirm PLAN_DIGEST_FROM_DRY_RUN
+```
+
+默认 dry-run 不修改 vault，不创建锁、报告或 WAL/SHM。无 WAL 时使用 SQLite 只读
+immutable 连接；存在 WAL 时在系统临时目录复制主文件和 WAL 后读取，避免原库产生 SHM。
+`row_bytes` 是待删除行各列的逻辑字节数，文件大小可精确列出，数据库 VACUUM 后的实际
+空间变化在 apply 报告中给出。digest 覆盖名单 username、各处计数、大小及文件版本，
+apply 持锁后重新计算；同步产生新数据也可能导致 digest 不匹配，需要重新 dry-run。
+
+apply 会拒绝正在运行的 `decode_media.py`、`convert_wxgf.py`、`index_media.py`、
+`link_media.py`（按 vault/tools 绝对路径 pgrep）。全程持有
+`structured/chat-archive.sqlite3.ingest.lock` 和 `media-links.sqlite3.lock`，还独占
+`media-transfer.lock`，阻止新接收/解码进程进入；四路媒体接收与批量解码平时共享后一把锁，
+不会互相串行。近期解码、媒体索引与文字 ingest 使用 ingest 锁。全部相关脚本应一起更新。
+占锁期间 Mac 的对应 SSH 调用失败，文字游标、近期媒体确认记录均不推进，之后自动重试。
+
+所有数据库修改先在 vault 同文件系统的私有副本中准备，全部通过外键、`quick_check`、
+归档 FTS5 `integrity-check` 和 VACUUM 后，逐个原子替换并清除旧 WAL/SHM。
+归档会重建外部内容的 `message_search`，更新 `build_metadata` 计数并追加仅含时间和计数的
+`purge:*` 记录。明文快照删除相应消息表及会话附属记录，群成员的联系人行保留。
+归档消息同时按名单 username、`unresolved:Msg_<md5>` 和 `message_sources` 中的排除表
+哈希选择，清理相应的未解析会话、正文、FTS 及关联记录，避免身份解析失败留下副本。
+迁移快照 `migrate/unspportmsg.db` 的 `UnsupportMessage` 按 `from_user`、`to_user`
+先判断群会话，再按私聊参与者匹配名单；保留群中由排除联系人发送的消息。
+该库同样在副本中清理并 VACUUM，更新快照哈希；库结构或会话归属无法可靠识别时拒绝执行。
+迁移消息中的媒体引用也参与共享文件归属判断。
+`hardlink.db` 仅删除 `dir2id` 明确映射到排除会话或其 attach 目录的记录，未确认的行
+保留并列入报告。
+
+快照中的 `message/message_fts.db` 使用 NAS 无法加载的 `MMFtsTokenizer`，因此整文件删除；
+其内容在构建归档时已保存在 `index_evidence`，清除时仅移除其中排除会话的证据。
+更新快照 `manifest.json`、`verified.json` 中已有哈希，移除已删除 FTS 的文件项，并写入
+完整 `database_hashes` 及仅含计数和时间的 `purged` 字段。
+
+媒体清除复用上述归属规则，同时清理 `media_files`、`decoded-media.sqlite3` 和链接库记录，
+删除对应 decoded 输出及空目录。已核对三个解码脚本：decoded 的 `path` 相对 `media/msg`，
+`output` 相对 `vault/decoded`。共享 token、共享文件、无法确定归属的文件保留；疑似路径
+越界或符号链接会拒绝执行。
+
+最终报告为 `vault/purge-<UTC时间>.json`（`0600`），包括每处前后计数和实际释放字节数；
+空间变化为负表示新元数据导致该文件变大。输出不包含正文、备注或资源 payload。
+清除需要容纳全部修改副本、VACUUM 临时空间和（有 WAL 时）最大库的系统临时空间。
+原子性以单个文件为单位，多文件发布不是一个总事务；人工完整验证应在 NAS 的隔离副本
+上先完成。VACUUM 消除 SQLite 活文件内的残页，不会清除 NAS 文件系统保留的旧快照或备份。
+
+沙箱验证结果和需人工完成的环境验证见 [VALIDATION.md](VALIDATION.md)。

@@ -2,12 +2,23 @@
 """Link exact MD5 references to files in the same conversation directory.
 Absence of an extractable reference is unknown, not proof an attachment is missing.
 """
-import argparse,collections,hashlib,json,re,sqlite3,time,fcntl,os
+import argparse,collections,hashlib,json,re,sqlite3,time,os
+from contextlib import closing, ExitStack
 from pathlib import Path
+from archive_state import atomic_json, file_lock
 
 def run(archive,output):
- os.umask(0o077);lock=open(str(output)+'.lock','w');fcntl.flock(lock,fcntl.LOCK_EX)
- src=sqlite3.connect(Path(archive).resolve().as_uri()+'?mode=ro',uri=True,timeout=120);out=sqlite3.connect(output)
+ os.umask(0o077)
+ with file_lock(str(output)+'.lock'):
+  return _run(archive,output)
+
+def _run(archive,output):
+ with ExitStack() as stack:
+  src=stack.enter_context(closing(sqlite3.connect(Path(archive).resolve().as_uri()+'?mode=ro',uri=True,timeout=120)))
+  out=stack.enter_context(closing(sqlite3.connect(output)))
+  return _link(src,out,output)
+
+def _link(src,out,output):
  out.executescript('CREATE TABLE IF NOT EXISTS file_tokens(chat_hash TEXT,token TEXT,path TEXT,PRIMARY KEY(chat_hash,token,path)); CREATE INDEX IF NOT EXISTS token_idx ON file_tokens(chat_hash,token); CREATE TABLE IF NOT EXISTS message_media(message_id INTEGER,path TEXT,evidence TEXT,PRIMARY KEY(message_id,path)); CREATE TABLE IF NOT EXISTS message_media_status(message_id INTEGER PRIMARY KEY,status TEXT);')
  for (path,) in src.execute('SELECT path FROM media_files'):
   parts=Path(path).parts
@@ -27,6 +38,6 @@ def run(archive,output):
   for path in found:out.execute('INSERT OR IGNORE INTO message_media VALUES (?,?,?)',(mid,path,'exact_xml_or_resource_md5_and_conversation'))
   out.execute('INSERT OR REPLACE INTO message_media_status VALUES (?,?)',(mid,status));counts[status]+=1
   if sum(counts.values())%5000==0:out.commit()
- out.commit();out.close();src.close();lock.close();report={'counts':counts,'completed_at':time.time(),'seconds':time.time()-start};Path(str(output)+'.report.json').write_text(json.dumps(report));print(json.dumps(report))
+ out.commit();report={'counts':counts,'completed_at':time.time(),'seconds':time.time()-start};atomic_json(Path(str(output)+'.report.json'),report);print(json.dumps(report))
 if __name__=='__main__':
  p=argparse.ArgumentParser();p.add_argument('--archive',required=True);p.add_argument('--output',required=True);a=p.parse_args();run(a.archive,a.output)

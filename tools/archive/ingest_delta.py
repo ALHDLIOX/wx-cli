@@ -4,9 +4,23 @@ Existing source edits are retained as evidence rather than silently replacing hi
 """
 import collections,gzip,json,sqlite3,sys,time,hashlib
 from build_archive import Builder,Decoder
+from pathlib import Path
+from contextlib import closing
+from archive_state import atomic_json, file_lock
 
 def ingest(path,packet):
- b=Builder.__new__(Builder);b.db=sqlite3.connect(path,timeout=60);b.db.execute('PRAGMA foreign_keys=ON');b.db.execute('PRAGMA journal_mode=WAL');b.db.execute('PRAGMA cache_size=-131072');b.names={};b.users=set();b.conv_seen=set();b.self_user=packet['self_user'];b.count=0;b.decode_counts=collections.Counter();dec=Decoder();added=0;edits=0;chats=set();initial_max=b.db.execute('SELECT max(id) FROM messages').fetchone()[0] or 0
+ path=Path(path)
+ with file_lock(str(path)+'.ingest.lock'):
+  atomic_json((path.parent.parent if path.parent.name=='structured' else path.parent)/'mac-heartbeat.json',
+              {'received_at':time.time(),'mac_status':packet.get('mac_status',{})})
+  return _ingest(path,packet)
+
+def _ingest(path,packet):
+ with closing(sqlite3.connect(path,timeout=60)) as db:
+  return _ingest_db(db,packet)
+
+def _ingest_db(db,packet):
+ b=Builder.__new__(Builder);b.db=db;b.db.execute('PRAGMA foreign_keys=ON');b.db.execute('PRAGMA journal_mode=WAL');b.db.execute('PRAGMA cache_size=-131072');b.names={};b.users=set();b.conv_seen=set();b.self_user=packet['self_user'];b.count=0;b.decode_counts=collections.Counter();dec=Decoder();added=0;edits=0;chats=set();initial_max=b.db.execute('SELECT max(id) FROM messages').fetchone()[0] or 0
  b.db.execute('CREATE TABLE IF NOT EXISTS incremental_edits(source_db TEXT,source_table TEXT,source_rowid INTEGER,content_sha256 TEXT,payload_json TEXT,observed_at REAL,PRIMARY KEY(source_db,source_table,source_rowid,content_sha256))')
  b.db.execute('CREATE TABLE IF NOT EXISTS incremental_media_refs(conversation TEXT,local_id INTEGER,timestamp INTEGER,server_id TEXT,tokens TEXT,PRIMARY KEY(conversation,local_id,timestamp,server_id))')
  with b.db:
@@ -32,5 +46,5 @@ def ingest(path,packet):
     b.db.execute('UPDATE build_metadata SET value=? WHERE key=?',(json.dumps(value+increment),field))
    b.db.execute('UPDATE build_metadata SET value=? WHERE key=?',(json.dumps(b.db.execute('SELECT count(*) FROM conversations WHERE message_count>0').fetchone()[0]),'conversations'))
 
- b.db.close();return report
+ return report
 if __name__=='__main__':print(json.dumps(ingest(sys.argv[1],json.loads(gzip.decompress(sys.stdin.buffer.read())))))

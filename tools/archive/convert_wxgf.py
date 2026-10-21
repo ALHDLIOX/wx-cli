@@ -4,6 +4,7 @@ Partition layout reference: https://github.com/sjzar/chatlog/blob/a16b689/pkg/ut
 """
 import argparse,json,sqlite3,subprocess,sys,hashlib,os,time
 from pathlib import Path
+from archive_state import atomic_json, file_lock
 from decode_media import decode,validated
 
 def convert(data):
@@ -24,7 +25,12 @@ def convert(data):
  validated(result.stdout);return result.stdout
 
 def main():
- p=argparse.ArgumentParser();p.add_argument('--root',type=Path,required=True);p.add_argument('--output',type=Path,required=True);p.add_argument('--manifest',required=True);a=p.parse_args();os.umask(0o077);key=json.load(sys.stdin);db=sqlite3.connect(a.manifest,timeout=60);counts={}
+ p=argparse.ArgumentParser();p.add_argument('--root',type=Path,required=True);p.add_argument('--output',type=Path,required=True);p.add_argument('--manifest',required=True);a=p.parse_args();os.umask(0o077);key=json.load(sys.stdin)
+ with file_lock(Path(a.manifest).parent/'media-transfer.lock',shared=True):
+  return run(a,key)
+
+def run(a,key):
+ db=sqlite3.connect(a.manifest,timeout=60);counts={}
  for rel,size,mtime in db.execute("SELECT path,size,mtime FROM decoded WHERE status='wxgf_needs_conversion'").fetchall():
   try:
    src=a.root/rel
@@ -34,6 +40,6 @@ def main():
    status='ok'
   except Exception as e:status=str(e) if isinstance(e,ValueError) else type(e).__name__
   counts[status]=counts.get(status,0)+1
-  Path(a.manifest+'.wxgf-status.json').write_text(json.dumps({'counts':counts,'at':time.time()}))
+  atomic_json(Path(a.manifest+'.wxgf-status.json'),{'counts':counts,'at':time.time()})
  print(json.dumps(counts))
 if __name__=='__main__':main()

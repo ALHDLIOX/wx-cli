@@ -1,7 +1,12 @@
 import unittest
-from decode_media import decode,validated
-from cryptography.hazmat.primitives.ciphers import Cipher,algorithms,modes
-from PIL import Image
+try:
+ from decode_media import decode,validated
+ from cryptography.hazmat.primitives.ciphers import Cipher,algorithms,modes
+ from PIL import Image
+except ModuleNotFoundError as error:
+ if error.name == 'PIL' or error.name == 'cryptography' or error.name.startswith(('PIL.', 'cryptography.')):
+  raise unittest.SkipTest('optional Pillow/cryptography dependency is unavailable') from error
+ raise
 import io,struct
 class MediaTest(unittest.TestCase):
  def test_roundtrip(self):

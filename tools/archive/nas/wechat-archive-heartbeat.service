@@ -1,0 +1,8 @@
+[Unit]
+Description=WeChat archive Mac heartbeat notification
+
+[Service]
+Type=oneshot
+User=root
+UMask=0077
+ExecStart=/usr/bin/python3 /pool-safe/wechat-vault/tools/nas/heartbeat.py --vault /pool-safe/wechat-vault
