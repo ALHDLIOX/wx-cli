@@ -220,8 +220,10 @@ def snapshot_plan(path, db, ownership, notes):
             if table.startswith('SessionUnread'):
                 plan.by_users(db, table, 'username_id', ids)
     elif name == 'contact.db':
-        ids = name_ids(db, 'name2id', users)
-        plan.by_users(db, 'chatroom_member', 'room_id', ids)
+        if 'chat_room' in plan.available:
+            where, args = in_values('username', users)
+            ids = {row[0] for row in db.execute('SELECT id FROM chat_room WHERE ' + where, args)}
+            plan.by_users(db, 'chatroom_member', 'room_id', ids)
         for table in ('contact', 'chat_room'):
             plan.by_users(db, table, 'username', users)
         plan.by_users(db, 'chat_room_info_detail', 'username_', users)

@@ -12,9 +12,9 @@ from unittest.mock import patch
 
 from archive_state import atomic_json, file_lock
 from build_archive import Builder
-from exclusion import chat_hash
+from exclusion import Ownership, chat_hash
 from ingest_delta import ingest
-from purge_conversations import execute, PurgeError, replica, sha256
+from purge_conversations import execute, prepare_database, PurgeError, replica, sha256, snapshot_plan
 from test_sync_hardening import EXCLUDED, KEPT, write_exclude
 
 
@@ -171,6 +171,31 @@ def tree_state(root):
 
 
 class PurgeTests(unittest.TestCase):
+    def test_contact_members_use_chat_room_ids(self):
+        for has_chat_room in (True, False):
+            with self.subTest(has_chat_room=has_chat_room), tempfile.TemporaryDirectory() as tmp:
+                path = Path(tmp) / 'contact.db'
+                excluded, kept = 'excluded@chatroom', 'kept@chatroom'
+                with closing(database(path, '''
+CREATE TABLE name2id(username TEXT);
+CREATE TABLE chatroom_member(room_id INTEGER,member_id INTEGER);
+''')) as db:
+                    db.executemany('INSERT INTO name2id(rowid,username) VALUES (?,?)',
+                                   [(1, excluded), (2, kept)])
+                    members = [(20, 3), (20, 4), (1, 5), (1, 6)]
+                    db.executemany('INSERT INTO chatroom_member VALUES (?,?)', members)
+                    if has_chat_room:
+                        db.execute('CREATE TABLE chat_room(id INTEGER,username TEXT)')
+                        db.executemany('INSERT INTO chat_room VALUES (?,?)',
+                                       [(20, excluded), (1, kept)])
+                    db.commit()
+                    plan = snapshot_plan(path, db, Ownership({excluded}), [])
+                target = Path(tmp) / 'purged.db'
+                prepare_database(plan, target, 'fixture')
+                with closing(sqlite3.connect(target)) as db:
+                    self.assertEqual(db.execute('SELECT * FROM chatroom_member ORDER BY room_id,member_id').fetchall(),
+                                     [(1, 5), (1, 6)] if has_chat_room else sorted(members))
+
     def test_dry_run_changes_nothing_and_reports_no_body(self):
         with tempfile.TemporaryDirectory() as tmp:
             vault, exclude, snap, _ = fixture(Path(tmp))
