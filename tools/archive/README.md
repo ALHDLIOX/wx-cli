@@ -107,3 +107,28 @@ missing downloads, connection failures, or image formats needing further work
 can delay availability. `attachments --message-id ID` on `query_archive.py`
 returns association evidence and decoded/original paths once indexed. Voice
 conversion and arbitrary older historical edits are outside these new workers.
+
+### macOS privacy prompts: persistent application deployment
+
+The earlier per-minute Python launch agents are retired. Directly relaunching a
+command-line interpreter to open another application's container can repeatedly
+trigger macOS cross-app privacy prompts. `macos/Launcher.swift` supplies a stable,
+locally signed application identity, `WeChat NAS Sync.app`, which starts
+`macos/supervisor.py` once. Three worker threads perform text, recent image, and
+full-media work in that same Python process. The media scanner also executes in
+process; SSH workers do not open the Mac's WeChat container.
+
+The user must explicitly enable Full Disk Access for this dedicated app in System
+Settings; do not edit TCC, grant broad access to a general Python interpreter, or
+programmatically click a privacy consent button. Keep the app stopped until this
+step is complete. Verify subsequent cycles under the app after authorization;
+build/signature checks alone do not prove the authorization works.
+
+Install one login agent that invokes `/usr/bin/open -gj APP_PATH` with RunAtLoad
+and no StartInterval/KeepAlive. Remove the previous three plists from LaunchAgents,
+not just unload them, so they cannot return at the next login. The app deliberately
+does not automatically relaunch a crashing Python worker. Private local config
+in `~/.wx-cli/nas-archive/supervisor-config.json` supplies the interpreter, repository,
+and supervisor paths. Do not replace the app's executable/signature casually after
+authorization. This application is not sandboxed: Full Disk Access is a broader
+OS permission than the particular WeChat paths used by these scripts.
