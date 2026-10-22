@@ -164,13 +164,14 @@ CREATE TABLE FtsDeleteInfo(session_id INTEGER);
 def list_manifest_fixture(root):
     vault, exclude, snap, removed_ids = fixture(root)
     source = snap / 'databases'
-    # Match the deployed 30-file snapshot and exercise untouched databases too.
-    for number in range(30 - len(list(source.rglob('*.db')))):
+    # Match the deployed 29 databases plus a top-level report.
+    for number in range(29 - len(list(source.rglob('*.db')))):
         with closing(database(source / 'other' / f'retained_{number}.db',
                               'CREATE TABLE retained(value TEXT);')):
             pass
+    (source / 'report.json').write_text('{"status": "verified"}\n')
     manifest = [{'path': str(path.relative_to(source)), 'bytes': path.stat().st_size,
-                 'sha256': sha256(path)} for path in sorted(source.rglob('*.db'))]
+                 'sha256': sha256(path)} for path in sorted(source.rglob('*')) if path.is_file()]
     atomic_json(snap / 'manifest.json', manifest)
     atomic_json(snap / 'verified.json', {'files': len(manifest),
                 'bytes': sum(entry['bytes'] for entry in manifest),
@@ -323,12 +324,15 @@ CREATE TABLE chatroom_member(room_id INTEGER,member_id INTEGER);
     def test_apply_list_manifest(self):
         with tempfile.TemporaryDirectory() as tmp:
             vault, exclude, snap, _ = list_manifest_fixture(Path(tmp))
+            report = next(entry for entry in json.loads((snap / 'manifest.json').read_text())
+                          if entry['path'] == 'report.json')
             digest = execute(vault, exclude)['plan_digest']
             with patch('purge_conversations.os.geteuid', return_value=0):
                 execute(vault, exclude, True, digest, no_process)
             manifest = json.loads((snap / 'manifest.json').read_text())
             self.assertIsInstance(manifest, list)
             self.assertEqual(len(manifest), 29)
+            self.assertIn(report, manifest)
             self.assertNotIn('message/message_fts.db', [entry['path'] for entry in manifest])
             for entry in manifest:
                 path = snap / 'databases' / entry['path']
@@ -339,11 +343,14 @@ CREATE TABLE chatroom_member(room_id INTEGER,member_id INTEGER);
             audit = json.loads(audit_path.read_text())
             self.assertEqual(set(audit), {'database_hashes', 'purged'})
             self.assertEqual(set(audit['purged']), {'at', 'counts'})
+            self.assertEqual(len(audit['database_hashes']), 28)
+            self.assertTrue(all(rel.endswith('.db') for rel in audit['database_hashes']))
             self.assertEqual(audit['purged']['counts']['databases/message/message_fts.db']['files'], 1)
             for rel, item in audit['database_hashes'].items():
                 self.assertEqual(item, {'bytes': (snap / rel).stat().st_size, 'sha256': sha256(snap / rel)})
             verified = json.loads((snap / 'verified.json').read_text())
             self.assertEqual(verified['files'], len(manifest))
+            self.assertEqual(verified['files'], 29)
             self.assertEqual(verified['bytes'], sum(entry['bytes'] for entry in manifest))
             self.assertTrue(verified['sha256_all_match'])
             self.assertEqual(verified['purged'], audit['purged'])
@@ -361,7 +368,10 @@ CREATE TABLE chatroom_member(room_id INTEGER,member_id INTEGER);
                 for value in (None, True, [], {}):
                     invalid.append(dict(entry, **{key: value}))
             invalid.extend([dict(entry, path=123), dict(entry, path='../outside.db'),
-                            dict(entry, path='missing.db'), dict(entry, bytes='123'),
+                            dict(entry, path='missing.db'), dict(entry, path='missing.json'),
+                            dict(entry, path='/outside.json'),
+                            dict(entry, path='report.json'), dict(entry, path='./report.json'),
+                            dict(entry, bytes='123'),
                             dict(entry, bytes=1.5), dict(entry, bytes=-1),
                             dict(entry, sha256=123), dict(entry, sha256='not-a-hash')])
             # Lock creation is independent of snapshot publication.
@@ -378,16 +388,65 @@ CREATE TABLE chatroom_member(room_id INTEGER,member_id INTEGER);
                             execute(vault, exclude, True, digest, no_process)
                     self.assertEqual(tree_state(vault), before)
 
+    def test_non_file_list_manifest_entry_changes_no_data(self):
+        for kind in ('symlink', 'directory', 'missing'):
+            with self.subTest(kind=kind), tempfile.TemporaryDirectory() as tmp:
+                vault, exclude, snap, _ = list_manifest_fixture(Path(tmp))
+                for lock in ('structured/chat-archive.sqlite3.ingest.lock', 'media-links.sqlite3.lock', 'media-transfer.lock'):
+                    with file_lock(vault / lock):
+                        pass
+                digest = execute(vault, exclude)['plan_digest']
+                report = snap / 'databases/report.json'
+                report.unlink()
+                if kind == 'symlink':
+                    target = Path(tmp) / 'outside.json'
+                    target.write_text('outside data')
+                    report.symlink_to(target)
+                elif kind == 'directory':
+                    report.mkdir()
+                if kind != 'symlink':
+                    digest = execute(vault, exclude)['plan_digest']
+                before = tree_state(vault)
+                error = 'unsafe_path' if kind == 'symlink' else 'invalid_snapshot_manifest'
+                with patch('purge_conversations.os.geteuid', return_value=0):
+                    with self.assertRaisesRegex(PurgeError, '^' + error + '$'):
+                        execute(vault, exclude, True, digest, no_process)
+                self.assertEqual(tree_state(vault), before)
+                if kind == 'symlink':
+                    self.assertTrue(report.is_symlink())
+                    self.assertEqual(target.read_text(), 'outside data')
+                elif kind == 'directory':
+                    self.assertTrue(report.is_dir())
+
     def test_list_verification_recomputed_for_incomplete_manifest(self):
+        for omitted in ('contact/contact.db', 'report.json'):
+            with self.subTest(omitted=omitted), tempfile.TemporaryDirectory() as tmp:
+                vault, exclude, snap, _ = list_manifest_fixture(Path(tmp))
+                manifest = json.loads((snap / 'manifest.json').read_text())
+                self.assertIn(omitted, [entry['path'] for entry in manifest])
+                atomic_json(snap / 'manifest.json', [entry for entry in manifest if entry['path'] != omitted])
+                atomic_json(snap / 'verified.json', {'sha256_all_match': True, 'at': 123.5})
+                digest = execute(vault, exclude)['plan_digest']
+                with patch('purge_conversations.os.geteuid', return_value=0):
+                    execute(vault, exclude, True, digest, no_process)
+                self.assertFalse(json.loads((snap / 'verified.json').read_text())['sha256_all_match'])
+
+    def test_list_manifest_recomputes_non_database_hash_and_size(self):
         with tempfile.TemporaryDirectory() as tmp:
             vault, exclude, snap, _ = list_manifest_fixture(Path(tmp))
             manifest = json.loads((snap / 'manifest.json').read_text())
-            atomic_json(snap / 'manifest.json', manifest[1:])
-            atomic_json(snap / 'verified.json', {'sha256_all_match': True, 'at': 123.5})
+            report = next(entry for entry in manifest if entry['path'] == 'report.json')
+            report.update(bytes=0, sha256='0' * 64)
+            atomic_json(snap / 'manifest.json', manifest)
             digest = execute(vault, exclude)['plan_digest']
             with patch('purge_conversations.os.geteuid', return_value=0):
                 execute(vault, exclude, True, digest, no_process)
-            self.assertFalse(json.loads((snap / 'verified.json').read_text())['sha256_all_match'])
+            report = next(entry for entry in json.loads((snap / 'manifest.json').read_text())
+                          if entry['path'] == 'report.json')
+            path = snap / 'databases/report.json'
+            self.assertEqual(report, {'path': 'report.json', 'bytes': path.stat().st_size,
+                                      'sha256': sha256(path)})
+            self.assertTrue(json.loads((snap / 'verified.json').read_text())['sha256_all_match'])
 
     def test_metadata_stage_failure_changes_no_data(self):
         with tempfile.TemporaryDirectory() as tmp:
