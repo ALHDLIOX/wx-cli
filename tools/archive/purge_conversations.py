@@ -15,6 +15,7 @@ from pathlib import Path
 import re
 import shutil
 import sqlite3
+import stat
 import subprocess
 import tempfile
 
@@ -534,7 +535,7 @@ def running_workers(vault, runner=None):
             raise PurgeError('process_check_failed')
 
 
-def read_snapshot_metadata(vault, snapshot, old_hashes):
+def read_snapshot_metadata(vault, snapshot):
     metadata = {}
     for name in ('manifest.json', 'verified.json', 'purge.json'):
         path = safe_path(vault, snapshot / name)
@@ -554,12 +555,18 @@ def read_snapshot_metadata(vault, snapshot, old_hashes):
                 digest = entry.get('sha256')
                 if (not isinstance(rel, str) or not rel
                         or Path(rel).is_absolute() or '..' in Path(rel).parts
-                        or 'databases/' + rel not in old_hashes or rel in seen
+                        or Path(rel) in seen
                         or type(size) is not int or size < 0
                         or not isinstance(digest, str)
                         or re.fullmatch('[0-9a-fA-F]{64}', digest) is None):
                     raise PurgeError('invalid_snapshot_manifest')
-                seen.add(rel)
+                try:
+                    entry_path = safe_path(vault, snapshot / 'databases' / rel)
+                    if not stat.S_ISREG(entry_path.lstat().st_mode):
+                        raise PurgeError('invalid_snapshot_manifest')
+                except (OSError, PurgeError):
+                    raise PurgeError('invalid_snapshot_manifest') from None
+                seen.add(Path(rel))
         elif not isinstance(value, dict):
             raise PurgeError('invalid_snapshot_manifest')
         metadata[name] = value
@@ -620,20 +627,26 @@ def prepare_snapshot(snapshot, counts, now, old_hashes, staged_paths, removed_pa
     manifest = metadata['manifest.json']
     result = {}
     if isinstance(manifest, list):
-        manifest = [dict(entry, **hashes['databases/' + entry['path']])
-                    for entry in manifest if 'databases/' + entry['path'] in hashes]
+        manifest = [dict(entry, bytes=staged_paths.get(path, path).stat().st_size,
+                         sha256=sha256(staged_paths.get(path, path)))
+                    for entry in manifest
+                    for path in [snapshot / 'databases' / entry['path']]
+                    if path not in removed_paths]
         result['purge.json'] = audit
-        manifest_hashes = {entry['path']: {'bytes': entry['bytes'], 'sha256': entry['sha256']}
+        manifest_hashes = {str(Path(entry['path'])): {'bytes': entry['bytes'], 'sha256': entry['sha256']}
                            for entry in manifest}
     else:
         manifest = rewrite(manifest)
         manifest.update(audit)
         manifest_hashes = manifest['database_hashes']
-    # Compare the new manifest to bytes from the staged databases, including
-    # unchanged databases. Never carry forward an earlier verification result.
-    actual = {rel: {'sha256': sha256(staged_paths.get(snapshot / rel, snapshot / rel)),
-                    'bytes': staged_paths.get(snapshot / rel, snapshot / rel).stat().st_size}
-              for rel in hashes}
+    # List manifests cover all snapshot files, including non-database files.
+    # Never carry forward an earlier verification result.
+    actual_paths = (sorted(path for path in (snapshot / 'databases').rglob('*')
+                           if stat.S_ISREG(path.lstat().st_mode) and path not in removed_paths)
+                    if isinstance(manifest, list) else [snapshot / rel for rel in hashes])
+    actual = {str(path.relative_to(snapshot)): {'sha256': sha256(staged_paths.get(path, path)),
+                                              'bytes': staged_paths.get(path, path).stat().st_size}
+              for path in actual_paths}
     if isinstance(manifest, list):
         actual = {rel.removeprefix('databases/'): item for rel, item in actual.items()}
     verified = dict(metadata['verified.json'])
@@ -669,7 +682,7 @@ def execute(vault, exclude, apply=False, confirm=None, process_runner=None):
                                 for path in (snapshot / 'databases').rglob('*.db')}
                       for snapshot in plan.snapshots}
         # Stage and validate every database and manifest before publishing any change.
-        metadata = {snapshot: read_snapshot_metadata(vault, snapshot, old_hashes[snapshot])
+        metadata = {snapshot: read_snapshot_metadata(vault, snapshot)
                     for snapshot in plan.snapshots}
         with tempfile.TemporaryDirectory(prefix='.purge-', dir=vault) as work:
             staged = []
