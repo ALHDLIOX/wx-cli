@@ -256,8 +256,40 @@ python3 /pool-safe/wechat-vault/tools/purge_conversations.py \
   --apply --confirm PLAN_DIGEST_FROM_DRY_RUN
 ```
 
+大归档推荐在 NVMe 上准备数据库。先创建由执行用户（这里是 root）拥有、权限 `0700`
+的私有目录，再给 dry-run 和 apply 都加上 `--work-dir`：
+
+```sh
+install -d -m 0700 /srv/workorder/.wechat-purge
+python3 /pool-safe/wechat-vault/tools/purge_conversations.py \
+  --vault /pool-safe/wechat-vault --exclude /private/exclude.json \
+  --work-dir /srv/workorder/.wechat-purge
+python3 /pool-safe/wechat-vault/tools/purge_conversations.py \
+  --vault /pool-safe/wechat-vault --exclude /private/exclude.json \
+  --work-dir /srv/workorder/.wechat-purge \
+  --apply --confirm PLAN_DIGEST_FROM_DRY_RUN
+```
+
+`--work-dir` 必须是已存在的绝对目录路径，不能是符号链接，属主必须为当前用户，
+权限不能宽于 `0700`；工具不会自动创建或放宽该目录权限。
+工具用 `mkdtemp` 在其中创建 `0700` 私有子目录，数据库复制、删行、FTS rebuild、
+VACUUM 和校验均在子目录进行。在打开任何 SQLite 连接前，把进程内的 `SQLITE_TMPDIR`、
+`TMPDIR` 和 `tempfile.tempdir` 都指向子目录，dry-run 读取 WAL 所需的副本也放在这里。
+退出时恢复进程临时目录设置，成功、异常或 SIGINT/SIGTERM 中断均会清理子目录及回拷临时文件。
+
+指定工作目录的 apply 在准备数据库副本前预检空间。令 S 为所有要修改的数据库主文件
+大小之和，工作目录所在文件系统的可用空间必须 **大于 S × 2.5 + 2 GiB**（常量 2.5
+预留 VACUUM 和回滚日志空间），vault 所在文件系统必须 **大于 S + 2 GiB**，用于暂存
+回拷文件。边界相等也拒绝执行；错误码分别为 `insufficient_work_dir_space` 和
+`insufficient_vault_space`。dry-run 不要求这些空间余量。
+所有数据库和元数据先准备好，随后逐个复制到 vault 中与目标同目录的 `0600` 私有临时文件，
+fsync 文件及目录并重新计算 SHA256。任一回拷哈希不一致以 `copy_back_hash_mismatch`
+中止，不发布任何文件；全部一致后才开始原子替换，避免跨文件系统 `os.replace`。
+
 默认 dry-run 不修改 vault，不创建锁、报告或 WAL/SHM。无 WAL 时使用 SQLite 只读
-immutable 连接；存在 WAL 时在系统临时目录复制主文件和 WAL 后读取，避免原库产生 SHM。
+immutable 连接；存在 WAL 时在临时目录复制主文件和 WAL 后读取，避免原库产生 SHM。
+不传 `--work-dir` 时仍使用原来的系统目录存放读取副本，apply 仍在 vault 的私有临时目录
+准备数据库，并在连接前把 `SQLITE_TMPDIR` 指向该目录，防止 SQLite 写入系统盘 `/var/tmp`。
 `row_bytes` 是待删除行各列的逻辑字节数，文件大小可精确列出，数据库 VACUUM 后的实际
 空间变化在 apply 报告中给出。digest 覆盖名单 username、各处计数、大小及文件版本，
 apply 持锁后重新计算；同步产生新数据也可能导致 digest 不匹配，需要重新 dry-run。
@@ -269,7 +301,7 @@ apply 会拒绝正在运行的 `decode_media.py`、`convert_wxgf.py`、`index_me
 不会互相串行。近期解码、媒体索引与文字 ingest 使用 ingest 锁。全部相关脚本应一起更新。
 占锁期间 Mac 的对应 SSH 调用失败，文字游标、近期媒体确认记录均不推进，之后自动重试。
 
-所有数据库修改先在 vault 同文件系统的私有副本中准备，全部通过外键、`quick_check`、
+所有数据库修改先在私有副本中准备（默认在 vault，指定 `--work-dir` 则在该目录），全部通过外键、`quick_check`、
 归档 FTS5 `integrity-check` 和 VACUUM 后，逐个原子替换并清除旧 WAL/SHM。
 归档会重建外部内容的 `message_search`，更新 `build_metadata` 计数并追加仅含时间和计数的
 `purge:*` 记录。明文快照删除相应消息表及会话附属记录，群成员的联系人行保留。
@@ -304,7 +336,11 @@ apply 会拒绝正在运行的 `decode_media.py`、`convert_wxgf.py`、`index_me
 
 最终报告为 `vault/purge-<UTC时间>.json`（`0600`），包括每处前后计数和实际释放字节数；
 空间变化为负表示新元数据导致该文件变大。输出不包含正文、备注或资源 payload。
-清除需要容纳全部修改副本、VACUUM 临时空间和（有 WAL 时）最大库的系统临时空间。
+apply 会在 stderr 实时输出一行一个 JSON 的阶段日志，包含 `stage`、UTC `at` 及数据库或
+元数据相对 `path`，覆盖复制、删除、FTS rebuild、VACUUM、校验、回拷、发布和媒体删除。
+日志不包含正文或名单内容；媒体删除日志不输出文件名。stdout 保持原来的结果或错误 JSON。
+默认模式需要容纳全部修改副本、VACUUM 临时空间和（有 WAL 时）最大库的系统临时空间；
+使用 NVMe 工作目录时，按上面的两项公式留出空间。
 原子性以单个文件为单位，多文件发布不是一个总事务；人工完整验证应在 NAS 的隔离副本
 上先完成。VACUUM 消除 SQLite 活文件内的残页，不会清除 NAS 文件系统保留的旧快照或备份。
 
