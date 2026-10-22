@@ -534,9 +534,42 @@ def running_workers(vault, runner=None):
             raise PurgeError('process_check_failed')
 
 
-def update_snapshot(snapshot, counts, now, old_hashes):
-    hashes = {str(path.relative_to(snapshot)): {'sha256': sha256(path), 'bytes': path.stat().st_size}
-              for path in sorted((snapshot / 'databases').rglob('*.db'))}
+def read_snapshot_metadata(vault, snapshot, old_hashes):
+    metadata = {}
+    for name in ('manifest.json', 'verified.json', 'purge.json'):
+        path = safe_path(vault, snapshot / name)
+        if name == 'purge.json':
+            continue
+        try:
+            value = json.loads(path.read_text()) if path.exists() else {}
+        except (ValueError, UnicodeError):
+            raise PurgeError('invalid_snapshot_manifest') from None
+        if name == 'manifest.json' and isinstance(value, list):
+            seen = set()
+            for entry in value:
+                if not isinstance(entry, dict):
+                    raise PurgeError('invalid_snapshot_manifest')
+                rel = entry.get('path')
+                size = entry.get('bytes')
+                digest = entry.get('sha256')
+                if (not isinstance(rel, str) or not rel
+                        or Path(rel).is_absolute() or '..' in Path(rel).parts
+                        or 'databases/' + rel not in old_hashes or rel in seen
+                        or type(size) is not int or size < 0
+                        or not isinstance(digest, str)
+                        or re.fullmatch('[0-9a-fA-F]{64}', digest) is None):
+                    raise PurgeError('invalid_snapshot_manifest')
+                seen.add(rel)
+        elif not isinstance(value, dict):
+            raise PurgeError('invalid_snapshot_manifest')
+        metadata[name] = value
+    return metadata
+
+
+def prepare_snapshot(snapshot, counts, now, old_hashes, staged_paths, removed_paths, metadata):
+    hashes = {str(path.relative_to(snapshot)): {'sha256': sha256(staged_paths.get(path, path)),
+                                              'bytes': staged_paths.get(path, path).stat().st_size}
+              for path in sorted((snapshot / 'databases').rglob('*.db')) if path not in removed_paths}
     replacements = {}
     removed_hashes = set()
     for rel, old in old_hashes.items():
@@ -582,15 +615,33 @@ def update_snapshot(snapshot, counts, now, old_hashes):
             return result
         return value
 
-    for name in ('manifest.json', 'verified.json'):
-        path = snapshot / name
-        value = json.loads(path.read_text()) if path.exists() else {}
-        if not isinstance(value, dict):
-            raise PurgeError('invalid_snapshot_manifest')
-        value = rewrite(value)
-        value['database_hashes'] = hashes
-        value['purged'] = {'at': now, 'counts': counts}
-        atomic_json(path, value)
+    purged = {'at': now, 'counts': counts}
+    audit = {'database_hashes': hashes, 'purged': purged}
+    manifest = metadata['manifest.json']
+    result = {}
+    if isinstance(manifest, list):
+        manifest = [dict(entry, **hashes['databases/' + entry['path']])
+                    for entry in manifest if 'databases/' + entry['path'] in hashes]
+        result['purge.json'] = audit
+        manifest_hashes = {entry['path']: {'bytes': entry['bytes'], 'sha256': entry['sha256']}
+                           for entry in manifest}
+    else:
+        manifest = rewrite(manifest)
+        manifest.update(audit)
+        manifest_hashes = manifest['database_hashes']
+    # Compare the new manifest to bytes from the staged databases, including
+    # unchanged databases. Never carry forward an earlier verification result.
+    actual = {rel: {'sha256': sha256(staged_paths.get(snapshot / rel, snapshot / rel)),
+                    'bytes': staged_paths.get(snapshot / rel, snapshot / rel).stat().st_size}
+              for rel in hashes}
+    if isinstance(manifest, list):
+        actual = {rel.removeprefix('databases/'): item for rel, item in actual.items()}
+    verified = dict(metadata['verified.json'])
+    verified.update(audit)
+    verified.update(files=len(manifest_hashes), bytes=sum(item['bytes'] for item in manifest_hashes.values()),
+                    sha256_all_match=manifest_hashes == actual)
+    result.update({'manifest.json': manifest, 'verified.json': verified})
+    return result
 
 
 def execute(vault, exclude, apply=False, confirm=None, process_runner=None):
@@ -618,17 +669,27 @@ def execute(vault, exclude, apply=False, confirm=None, process_runner=None):
                                 for path in (snapshot / 'databases').rglob('*.db')}
                       for snapshot in plan.snapshots}
         # Stage and validate every database and manifest before publishing any change.
-        for snapshot in plan.snapshots:
-            for name in ('manifest.json', 'verified.json'):
-                path = snapshot / name
-                if path.exists() and not isinstance(json.loads(path.read_text()), dict):
-                    raise PurgeError('invalid_snapshot_manifest')
+        metadata = {snapshot: read_snapshot_metadata(vault, snapshot, old_hashes[snapshot])
+                    for snapshot in plan.snapshots}
         with tempfile.TemporaryDirectory(prefix='.purge-', dir=vault) as work:
             staged = []
             for number, changes in enumerate(plan.databases):
                 target = Path(work) / str(number)
                 prepare_database(changes, target, now)
                 staged.append((changes, target))
+            staged_paths = {changes.path: target for changes, target in staged}
+            staged_metadata = []
+            for number, snapshot in enumerate(sorted(plan.snapshots)):
+                counts = {str(changes.path.relative_to(snapshot)): changes.counts for changes in plan.databases
+                          if changes.path.is_relative_to(snapshot)}
+                counts.update({str(path.relative_to(snapshot)): {'files': 1, 'bytes': plan.observed[str(path)][0]}
+                               for path in plan.files if path.is_relative_to(snapshot)})
+                values = prepare_snapshot(snapshot, counts, now, old_hashes[snapshot],
+                                          staged_paths, plan.files, metadata[snapshot])
+                for name, value in values.items():
+                    target = Path(work) / (str(number) + '-' + name)
+                    atomic_json(target, value)
+                    staged_metadata.append((snapshot / name, target))
             running_workers(vault, process_runner)
             # Reject changes during preparation; the two locks exclude ingest/link.
             if any(not Path(path).exists() or signature(Path(path)) != tuple(value)
@@ -642,12 +703,8 @@ def execute(vault, exclude, apply=False, confirm=None, process_runner=None):
                     sidecar.unlink(missing_ok=True)
             for path in sorted(plan.files):
                 path.unlink()
-        for snapshot in sorted(plan.snapshots):
-            counts = {str(changes.path.relative_to(snapshot)): changes.counts for changes in plan.databases
-                      if changes.path.is_relative_to(snapshot)}
-            counts.update({str(path.relative_to(snapshot)): {'files': 1, 'bytes': plan.observed[str(path)][0]}
-                           for path in plan.files if path.is_relative_to(snapshot)})
-            update_snapshot(snapshot, counts, now, old_hashes[snapshot])
+            for path, target in staged_metadata:
+                os.replace(target, path)
         for root in (vault / 'media/msg', vault / 'decoded'):
             if root.exists():
                 for parent, dirs, files in os.walk(root, topdown=False):
