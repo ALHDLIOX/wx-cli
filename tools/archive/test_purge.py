@@ -189,6 +189,63 @@ def tree_state(root):
 
 
 class PurgeTests(unittest.TestCase):
+    def test_superseded_sources_purged_by_table_and_message_conversation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            vault = root / 'vault'
+            archive = vault / 'structured/chat-archive.sqlite3'
+            with redirect_stdout(io.StringIO()):
+                Builder(root, archive, 'self').finish()
+            exclude = root / 'exclude.json'
+            write_exclude(exclude)
+            rows = [message_row(EXCLUDED, 1, 'PRIVATE excluded', 1),
+                    message_row(KEPT, 1, 'retained history', 2),
+                    dict(message_row(EXCLUDED, 1, 'PRIVATE sparse', 3), conversation='sparse')]
+            ingest(archive, {'self_user': 'self', 'rows': rows})
+            ingest(archive, {'self_user': 'self', 'rows': [dict(r, timestamp=2) for r in rows]})
+            with closing(sqlite3.connect(archive)) as db, db:
+                # Only the historical source proves ownership of the sparse old message.
+                db.execute('UPDATE message_sources SET source_table=? WHERE source_rowid=3',
+                           ('Msg_' + chat_hash('sparse'),))
+                # The excluded conversation must also purge a nonmatching historical table.
+                db.execute('UPDATE superseded_sources SET source_table=? WHERE source_rowid=1',
+                           ('Msg_' + chat_hash('alias'),))
+            before = tree_state(vault)
+            plan = execute(vault, exclude)
+            self.assertEqual(before, tree_state(vault))
+            archive_summary = next(p for p in plan['databases'] if p['path'].endswith('chat-archive.sqlite3'))
+            self.assertEqual(archive_summary['delete']['superseded_sources'], 2)
+            with patch('purge_conversations.os.geteuid', return_value=0):
+                execute(vault, exclude, True, plan['plan_digest'], no_process)
+            with closing(sqlite3.connect(archive)) as db:
+                self.assertEqual(db.execute('SELECT source_rowid FROM superseded_sources').fetchall(), [(2,)])
+                self.assertEqual(db.execute('SELECT count(*) FROM messages').fetchone()[0], 3)
+                self.assertEqual(db.execute('SELECT count(*) FROM message_sources').fetchone()[0], 2)
+                self.assertEqual(json.loads(db.execute("SELECT value FROM build_metadata WHERE key='source_rows'").fetchone()[0]), 3)
+                self.assertEqual(json.loads(db.execute("SELECT value FROM build_metadata WHERE key='source_duplicates'").fetchone()[0]), 0)
+                self.assertEqual(db.execute("SELECT count(*) FROM message_search WHERE message_search MATCH 'PRIVATE'").fetchone()[0], 1)
+                self.assertEqual(db.execute('PRAGMA foreign_key_check').fetchall(), [])
+                db.execute("INSERT INTO message_search(message_search,rank) VALUES('integrity-check',1)")
+
+    def test_superseded_variant_preserves_shared_media(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            vault, exclude, _, _ = fixture(Path(tmp))
+            archive = vault / 'structured/chat-archive.sqlite3'
+            # Merge a source variant into KEPT's existing server-ID message.
+            variant = dict(message_row(KEPT, 49, app('exclusive.bin'), 40), server_id=4)
+            ingest(archive, {'self_user': 'fixture_self', 'rows': [variant]})
+            ingest(archive, {'self_user': 'fixture_self', 'rows': [dict(variant, timestamp=2, content_hex=b'new occupant'.hex())]})
+            with closing(sqlite3.connect(archive)) as db:
+                self.assertEqual(db.execute('SELECT variant_text FROM superseded_sources').fetchall(), [(app('exclusive.bin'),)])
+            plan = execute(vault, exclude)
+            self.assertNotIn('media/msg/file/2026-01/exclusive.bin', [f['path'] for f in plan['files']])
+            with patch('purge_conversations.os.geteuid', return_value=0):
+                execute(vault, exclude, True, plan['plan_digest'], no_process)
+            self.assertTrue((vault / 'media/msg/file/2026-01/exclusive.bin').exists())
+            with closing(sqlite3.connect(archive)) as db:
+                self.assertEqual(db.execute('SELECT count(*) FROM superseded_sources').fetchone()[0], 1)
+                self.assertEqual(db.execute('PRAGMA foreign_key_check').fetchall(), [])
+
     def test_contact_members_use_chat_room_ids(self):
         for has_chat_room in (True, False):
             with self.subTest(has_chat_room=has_chat_room), tempfile.TemporaryDirectory() as tmp:

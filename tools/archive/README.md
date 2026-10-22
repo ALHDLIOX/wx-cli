@@ -30,6 +30,10 @@ results contain private data; do not publish them in logs or Git.
 - `message_sources`: exact source database, table, and row ID, plus source payload
   hash. Read the original snapshot to recover all original columns and bytes.
   When a merged source contains different decoded text, `variant_text` retains it.
+- `superseded_sources`: created idempotently by incremental ingest when a row ID
+  is reused. It retains the old source fields and message link, plus
+  `superseded_at`; repeated reuse of the same slot is supported. Source counts
+  include both current and superseded sources.
 - `source_tables`: source/import counts for reconciliation.
 - `index_evidence`: FTS content rows preserved separately. These may be snippets
   and are **not** added to the canonical message count.
@@ -74,10 +78,23 @@ state file identifies the previously verified plaintext snapshot and account.
 Initial row cursors come from that snapshot; new shards start at row zero.
 A recent row tail is replayed, so same-second messages are not skipped. A local
 payload fingerprint avoids repeatedly uploading unchanged rows. NAS commits an
-idempotent batch before the Mac advances its cursors. Changed source payloads
-are retained in `incremental_edits`; arbitrary edits to older rows outside the
-replay tail and deleted messages are not fully reconciled. Salt changes or rowid
-resets stop collection explicitly. Keys and message payloads must never enter Git.
+idempotent batch before the Mac advances its cursors. A changed payload is retained
+in `incremental_edits` only when `local_id`, timestamp (`create_time`), and
+`server_id` all match the existing source. A change to any of these fields means
+a new message: ingest moves the previous source to `superseded_sources` in the
+same transaction and retains both messages, including zero-server-ID messages.
+Mac `seen` hashes only decide which rows to resend, not their NAS identity.
+Arbitrary edits to older rows outside the replay tail are not fully reconciled;
+source deletions do not remove archived history.
+
+For each table, a positive high row ID below the cursor by at most
+`ROWID_ROLLBACK_LIMIT = 1000` is treated as tail deletion. The cursor rolls back
+to that high row ID after NAS acknowledgement. A larger drop, or an empty table
+with a positive cursor, logs a warning and skips only that table without changing
+its cursor or sending its rows; other tables continue. Diagnostics count affected
+tables per round in `rowid_rollbacks` and `blocked_tables`. A salt change still
+stops the entire round with `source_generation_changed`.
+Keys and message payloads must never enter Git.
 The deployment polls messages every minute while the Mac user session is active;
 sleep/offline periods delay collection until a subsequent successful run.
 
@@ -178,7 +195,11 @@ SQL、聊天正文、密钥或远端 payload 混入诊断。状态、计划和�
 
 文字 worker 每轮执行 `/usr/bin/pgrep -x WeChat`，返回 0 时 `wechat_running=true`；
 微信未运行时仍正常同步。每包（包括空包）携带 `mac_status`，仅含三个 worker 的
-`stage/last_success_at/consecutive_errors/error_type/error_summary` 和微信运行状态。
+`stage/last_success_at/consecutive_errors/error_type/error_summary`、微信运行状态，以及
+顶层的 `blocked_tables`、`rowid_rollbacks`（本轮统计；未完成消息表检查时为未知）。
+文字 worker 失败后，supervisor 使用相同 SSH 命令补发仅含 `self_user` 和最新
+`mac_status` 的状态包，`rows`、`resource_refs` 均为空；补发失败只记录安全日志，
+下一轮继续。状态空包仅原子更新 NAS 心跳，不打开归档数据库、不迁移表或更新归档元数据。
 `supervisor-config.json` 继续使用 `repository`、`python`、`supervisor` 三个字段；
 `macos/supervisor.py` 的位置不变，无需修改、重编译或重新签名 `Launcher.swift`。
 
@@ -211,6 +232,8 @@ SQL、聊天正文、密钥或远端 payload 混入诊断。状态、计划和�
 `vault/mac-heartbeat.json` 的 `received_at` 与 `mac_status`，兼容没有状态字段的旧包。
 定时器每 5 分钟检查一次：超时告警“Mac 同步已中断 N 分钟”，微信未运行告警一次，
 任一 worker 连续失败达到阈值时告警并注明 worker 名和安全错误摘要。
+`blocked_tables > 0` 时告警一次“有 N 张消息表因行号异常暂停同步”，清零后通知“已恢复”；
+缺少统计时保留原告警状态，不误判恢复。
 同一条件持续时只告警一次，恢复时通知“已恢复”及中断分钟数；旧包缺少的状态不推断为恢复。
 去重状态为私有、原子写入的 `heartbeat-state.json`。`hermes send -t TARGET -q 文本`
 使用参数列表执行，任何一次发送失败都不更新本轮去重状态，下轮重试。
@@ -250,8 +273,11 @@ apply 会拒绝正在运行的 `decode_media.py`、`convert_wxgf.py`、`index_me
 归档 FTS5 `integrity-check` 和 VACUUM 后，逐个原子替换并清除旧 WAL/SHM。
 归档会重建外部内容的 `message_search`，更新 `build_metadata` 计数并追加仅含时间和计数的
 `purge:*` 记录。明文快照删除相应消息表及会话附属记录，群成员的联系人行保留。
-归档消息同时按名单 username、`unresolved:Msg_<md5>` 和 `message_sources` 中的排除表
+归档消息同时按名单 username、`unresolved:Msg_<md5>` 和
+`message_sources` / `superseded_sources` 中的排除表
 哈希选择，清理相应的未解析会话、正文、FTS 及关联记录，避免身份解析失败留下副本。
+两张来源表也按其 `message_id` 所属会话清理；保留会话的历史来源变体继续参与共享媒体
+归属判断。清除后的来源计数包含两张来源表。
 迁移快照 `migrate/unspportmsg.db` 的 `UnsupportMessage` 按 `from_user`、`to_user`
 先判断群会话，再按私聊参与者匹配名单；保留群中由排除联系人发送的消息。
 该库同样在副本中清理并 VACUUM，更新快照哈希；库结构或会话归属无法可靠识别时拒绝执行。

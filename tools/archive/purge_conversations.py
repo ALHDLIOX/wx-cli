@@ -258,8 +258,11 @@ def archive_plan(path, db, ownership, media_paths):
     where, args = in_values('conversation', users)
     ids = {row[0] for row in db.execute('SELECT id FROM messages WHERE ' + where, args)}
     source_where, source_args = in_values('source_table', ownership.tables)
-    ids.update(row[0] for row in db.execute('SELECT message_id FROM message_sources WHERE ' + source_where, source_args))
-    plan.by_users(db, 'message_sources', 'message_id', ids)
+    for table in ('message_sources', 'superseded_sources'):
+        if table in plan.available:
+            ids.update(row[0] for row in db.execute('SELECT message_id FROM ' + ident(table) + ' WHERE ' + source_where, source_args))
+    for table in ('message_sources', 'superseded_sources'):
+        plan.by_users(db, table, 'message_id', ids)
     plan.delete(db, 'index_evidence', where + ' OR ' + source_where, args + source_args)
     if 'resource_messages' in plan.available:
         plan.delete(db, 'resource_details', 'message_resource_id IN (SELECT resource_id FROM resource_messages WHERE ' + where + ')', args)
@@ -285,10 +288,12 @@ def collect_archive(db, ownership):
     if 'messages' in available:
         for user, body, status in db.execute('SELECT conversation,body_text,decode_status FROM messages WHERE type_code IN (3,43,49,62)'):
             ownership.add_message(user, body, status in ('ok', 'empty'))
-    if {'messages', 'message_sources'} <= available:
+    for table in ('message_sources', 'superseded_sources'):
+        if not {'messages', table} <= available:
+            continue
         # A new source can merge into an existing message without being an edit.
         # Its decoded variant has independent references and parsing validity.
-        for user, body in db.execute('SELECT m.conversation,s.variant_text FROM message_sources s '
+        for user, body in db.execute('SELECT m.conversation,s.variant_text FROM ' + ident(table) + ' s '
                                      'JOIN messages m ON m.id=s.message_id '
                                      'WHERE m.type_code IN (3,43,49,62) AND s.variant_text IS NOT NULL'):
             ownership.add_message(user, body)
@@ -472,11 +477,16 @@ def refresh_metadata(db, counts, now):
         if table in available:
             values[field] = db.execute('SELECT count(*) FROM ' + ident(table)).fetchone()[0]
     values['conversations'] = db.execute('SELECT count(*) FROM conversations WHERE message_count>0').fetchone()[0]
+    if 'superseded_sources' in available:
+        values['source_rows'] += db.execute('SELECT count(*) FROM superseded_sources').fetchone()[0]
     values['source_duplicates'] = values['source_rows'] - values['messages']
     values['sender_unknown'] = db.execute('SELECT count(*) FROM messages WHERE sender IS NULL').fetchone()[0]
     values['unresolved_conversations'] = db.execute("SELECT count(*) FROM conversations WHERE username LIKE 'unresolved:%' AND message_count>0").fetchone()[0]
     values['timestamp_range'] = list(db.execute('SELECT min(timestamp),max(timestamp) FROM messages').fetchone())
-    values['decode_status'] = dict(db.execute('SELECT m.decode_status,count(*) FROM message_sources s JOIN messages m ON m.id=s.message_id GROUP BY m.decode_status'))
+    sources = 'SELECT message_id FROM message_sources'
+    if 'superseded_sources' in available:
+        sources += ' UNION ALL SELECT message_id FROM superseded_sources'
+    values['decode_status'] = dict(db.execute('SELECT m.decode_status,count(*) FROM (' + sources + ') s JOIN messages m ON m.id=s.message_id GROUP BY m.decode_status'))
     if 'media_files' in available:
         values['media_bytes'] = db.execute('SELECT coalesce(sum(bytes),0) FROM media_files').fetchone()[0]
     for key, value in values.items():
