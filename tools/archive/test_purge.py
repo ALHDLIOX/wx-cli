@@ -1,20 +1,24 @@
-from contextlib import redirect_stdout, closing
+from contextlib import redirect_stdout, redirect_stderr, closing
 import hashlib
 import io
 import json
+import os
 from pathlib import Path
+import shutil
 import sqlite3
 import subprocess
 import sys
 import tempfile
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from archive_state import atomic_json, file_lock
 from build_archive import Builder
 from exclusion import Ownership, chat_hash
 from ingest_delta import ingest
-from purge_conversations import execute, prepare_database, PurgeError, replica, sha256, snapshot_plan
+from purge_conversations import (execute, prepare_database, PurgeError, replica, sha256, snapshot_plan,
+                                 SPACE_RESERVE, WORK_SPACE_MULTIPLIER, vault_copy)
 from test_sync_hardening import EXCLUDED, KEPT, write_exclude
 
 
@@ -188,7 +192,252 @@ def tree_state(root):
             for path in root.rglob('*') if path.is_file()}
 
 
+def initialize_locks(vault):
+    # Persistent coordination files are not part of database publication.
+    for lock in ('structured/chat-archive.sqlite3.ingest.lock', 'media-links.sqlite3.lock', 'media-transfer.lock'):
+        with file_lock(vault / lock):
+            pass
+
+
 class PurgeTests(unittest.TestCase):
+    def test_work_dir_apply_matches_default_and_logs_safe_stages(self):
+        with tempfile.TemporaryDirectory() as tmp, tempfile.TemporaryDirectory() as external:
+            root, work = Path(tmp), Path(external)
+            vault, exclude, _, _ = list_manifest_fixture(root)
+            other = root / 'other-vault'
+            shutil.copytree(vault, other)
+            events = io.StringIO()
+            # Identical timestamps make database and manifest hashes comparable.
+            import datetime
+            class Clock(datetime.datetime):
+                @classmethod
+                def now(cls, tz=None):
+                    return cls(2026, 10, 22, tzinfo=tz)
+            with patch('purge_conversations.dt.datetime', Clock), patch('purge_conversations.os.geteuid', return_value=0):
+                with redirect_stderr(io.StringIO()):
+                    default = execute(vault, exclude, True, execute(vault, exclude)['plan_digest'], no_process)
+                plan = execute(other, exclude, work_dir=work)
+                self.assertEqual(plan, execute(other, exclude))
+                original_replace = os.replace
+                def replace(source, target):
+                    if Path(target).is_relative_to(other):
+                        self.assertEqual(Path(source).parent, Path(target).parent)
+                    return original_replace(source, target)
+                with redirect_stderr(events), patch('purge_conversations.os.replace', side_effect=replace):
+                    result = execute(other, exclude, True, plan['plan_digest'], no_process, work_dir=work)
+            self.assertEqual(list(work.iterdir()), [])
+            for key in ('databases', 'files', 'released_bytes'):
+                self.assertEqual(result[key], default[key])
+            contents = lambda directory: {str(p.relative_to(directory)): sha256(p)
+                                          for p in directory.rglob('*') if p.is_file() and not p.name.startswith('purge-')}
+            self.assertEqual(contents(vault), contents(other))
+            for private in ('PRIVATE', EXCLUDED, KEPT, 'exclusive.bin', 'retained history'):
+                self.assertNotIn(private, events.getvalue())
+            lines = [json.loads(line) for line in events.getvalue().splitlines()]
+            stages = [event['stage'] for event in lines]
+            self.assertTrue({'prepare_database', 'copy_database', 'delete_rows', 'rebuild_fts', 'vacuum',
+                             'validate_database', 'copy_back', 'publish_database', 'publish_metadata',
+                             'delete_media', 'write_report'} <= set(stages))
+            self.assertLess(max(i for i, s in enumerate(stages) if s == 'validate_database'), stages.index('copy_back'))
+            self.assertLess(max(i for i, s in enumerate(stages) if s == 'copy_back'), stages.index('publish_database'))
+            for event in lines:
+                self.assertLessEqual(set(event), {'stage', 'at', 'path'})
+                datetime.datetime.fromisoformat(event['at'])
+                if 'path' in event:
+                    self.assertFalse(Path(event['path']).is_absolute())
+            self.assertFalse(list(other.rglob('.purge-*')))
+
+    def test_copy_back_fsyncs_file_and_directory_before_hash_check(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / 'source'
+            source.write_bytes(b'fixture database')
+            vault = root / 'vault'
+            vault.mkdir()
+            destination = vault / 'database'
+            original_fsync = os.fsync
+            calls = []
+            def fsync(fd):
+                import stat
+                calls.append('directory' if stat.S_ISDIR(os.fstat(fd).st_mode) else 'file')
+                return original_fsync(fd)
+            def digest(path):
+                if path.parent == vault:
+                    self.assertEqual(calls, ['file', 'directory'])
+                return sha256(path)
+            with patch('purge_conversations.os.fsync', side_effect=fsync), patch('purge_conversations.sha256', side_effect=digest):
+                with vault_copy(source, destination) as target:
+                    self.assertEqual(target.parent, destination.parent)
+                    self.assertEqual(target.read_bytes(), source.read_bytes())
+                    self.assertEqual(target.stat().st_mode & 0o777, 0o600)
+                    self.assertFalse(destination.exists())
+            self.assertFalse(target.exists())
+            self.assertEqual(list(vault.iterdir()), [])
+
+    def test_work_dir_rejects_unsafe_paths_in_both_modes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            vault, exclude, _, _ = fixture(root)
+            private = root / 'private'
+            private.mkdir(mode=0o700)
+            wide = root / 'wide'
+            wide.mkdir(mode=0o755)
+            wide.chmod(0o755)
+            link = root / 'link'
+            link.symlink_to(private, target_is_directory=True)
+            regular = root / 'file'
+            regular.touch()
+            cases = [(Path('relative'), 'work_dir_not_absolute'), (wide, 'work_dir_permissions'),
+                     (link, 'work_dir_symlink'), (root / 'missing', 'work_dir_not_directory'),
+                     (regular, 'work_dir_not_directory')]
+            before = tree_state(vault)
+            for apply in (False, True):
+                for path, code in cases:
+                    with self.subTest(apply=apply, path=path), patch('purge_conversations.os.geteuid', return_value=0):
+                        with self.assertRaisesRegex(PurgeError, '^' + code + '$'):
+                            execute(vault, exclude, apply, 'unused', no_process, work_dir=path)
+                        self.assertEqual(tree_state(vault), before)
+                with patch('purge_conversations.os.getuid', return_value=os.getuid() + 1):
+                    with patch('purge_conversations.os.geteuid', return_value=0):
+                        with self.assertRaisesRegex(PurgeError, 'work_dir_owner_mismatch'):
+                            execute(vault, exclude, apply, 'unused', no_process, work_dir=private)
+            self.assertEqual(list(private.iterdir()), [])
+
+    def test_work_dir_hash_mismatch_never_publishes_and_cleans_all_copies(self):
+        with tempfile.TemporaryDirectory() as tmp, tempfile.TemporaryDirectory() as external:
+            vault, exclude, _, _ = list_manifest_fixture(Path(tmp))
+            work = Path(external)
+            initialize_locks(vault)
+            plan = execute(vault, exclude)
+            before = tree_state(vault)
+            # Fail both an early database copy and a late metadata copy.
+            for failure_at in (1, len(plan['databases']) + 2):
+                checked = []
+                def corrupt_hash(path):
+                    if path.is_relative_to(vault) and path.name.startswith('.purge-') and path.suffix == '.tmp':
+                        self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+                        checked.append(path)
+                        if len(checked) == failure_at:
+                            return '0' * 64
+                    return sha256(path)
+                with self.subTest(failure_at=failure_at), patch('purge_conversations.os.geteuid', return_value=0):
+                    with patch('purge_conversations.sha256', side_effect=corrupt_hash), redirect_stderr(io.StringIO()):
+                        with self.assertRaisesRegex(PurgeError, 'copy_back_hash_mismatch'):
+                            execute(vault, exclude, True, plan['plan_digest'], no_process, work_dir=work)
+                self.assertEqual(len(checked), failure_at)
+                self.assertEqual(tree_state(vault), before)
+                self.assertFalse(list(vault.rglob('.purge-*')))
+                self.assertEqual(list(work.iterdir()), [])
+
+    def test_work_dir_space_checks_before_preparation(self):
+        with tempfile.TemporaryDirectory() as tmp, tempfile.TemporaryDirectory() as external:
+            vault, exclude, _, _ = fixture(Path(tmp))
+            work = Path(external)
+            initialize_locks(vault)
+            plan = execute(vault, exclude)
+            before = tree_state(vault)
+            size = sum((vault / item['path']).stat().st_size for item in plan['databases'])
+            limits = {'work_dir': size * WORK_SPACE_MULTIPLIER + SPACE_RESERVE,
+                      'vault': size + SPACE_RESERVE}
+            for location in limits:
+                for free in (0, limits[location]):
+                    calls = []
+                    def disk_usage(path):
+                        place = 'work_dir' if Path(path).is_relative_to(work) else 'vault'
+                        calls.append(place)
+                        return SimpleNamespace(free=free if place == location else limits[place] + 1)
+                    with self.subTest(location=location, free=free), patch('purge_conversations.os.geteuid', return_value=0):
+                        with patch('purge_conversations.shutil.disk_usage', side_effect=disk_usage):
+                            with patch('purge_conversations.prepare_database') as prepare, patch('purge_conversations.shutil.copyfileobj') as copy:
+                                with self.assertRaisesRegex(PurgeError, 'insufficient_' + location + '_space'):
+                                    execute(vault, exclude, True, plan['plan_digest'], no_process, work_dir=work)
+                                prepare.assert_not_called()
+                                copy.assert_not_called()
+                    self.assertIn(location, calls)
+                    self.assertEqual(tree_state(vault), before)
+                    self.assertFalse(list(vault.rglob('.purge-*')))
+                    self.assertEqual(list(work.iterdir()), [])
+
+    def test_work_dir_cleans_copies_on_error_and_interrupt(self):
+        with tempfile.TemporaryDirectory() as tmp, tempfile.TemporaryDirectory() as external:
+            vault, exclude, _, _ = fixture(Path(tmp))
+            work = Path(external)
+            initialize_locks(vault)
+            digest = execute(vault, exclude)['plan_digest']
+            before = tree_state(vault)
+            original_copy = shutil.copyfileobj
+            for error in (OSError('injected'), KeyboardInterrupt(), SystemExit(143)):
+                copied = []
+                def interrupted_copy(source, target):
+                    original_copy(source, target)
+                    copied.append(target.name)
+                    if len(copied) == 2:
+                        raise error
+                with self.subTest(error=type(error).__name__), patch('purge_conversations.os.geteuid', return_value=0):
+                    with patch('purge_conversations.shutil.copyfileobj', side_effect=interrupted_copy), redirect_stderr(io.StringIO()):
+                        with self.assertRaises(type(error)):
+                            execute(vault, exclude, True, digest, no_process, work_dir=work)
+                self.assertEqual(len(copied), 2)
+                self.assertEqual(tree_state(vault), before)
+                self.assertFalse(list(vault.rglob('.purge-*')))
+                self.assertEqual(list(work.iterdir()), [])
+
+    def test_temporary_settings_precede_connections_and_are_restored(self):
+        with tempfile.TemporaryDirectory() as tmp, tempfile.TemporaryDirectory() as external:
+            vault, exclude, _, _ = fixture(Path(tmp))
+            original_connect = sqlite3.connect
+            previous = {key: os.environ.get(key) for key in ('SQLITE_TMPDIR', 'TMPDIR')}
+            previous_tempdir = tempfile.tempdir
+            for parent in (Path(external), None):
+                seen = []
+                def connect(*args, **kwargs):
+                    directory = Path(os.environ['SQLITE_TMPDIR'])
+                    self.assertEqual(directory.parent, parent or vault)
+                    self.assertEqual(directory.stat().st_mode & 0o777, 0o700)
+                    if parent is not None:
+                        self.assertEqual(os.environ['TMPDIR'], str(directory))
+                        self.assertEqual(tempfile.tempdir, str(directory))
+                    seen.append(directory)
+                    return original_connect(*args, **kwargs)
+                digest = execute(vault, exclude)['plan_digest']
+                with patch('purge_conversations.sqlite3.connect', side_effect=connect), patch('purge_conversations.os.geteuid', return_value=0):
+                    with patch('purge_conversations.validate', side_effect=PurgeError('injected')), redirect_stderr(io.StringIO()):
+                        with self.assertRaisesRegex(PurgeError, 'injected'):
+                            execute(vault, exclude, True, digest, no_process, work_dir=parent)
+                self.assertTrue(seen)
+                self.assertTrue(all(not directory.exists() for directory in seen))
+                self.assertEqual({key: os.environ.get(key) for key in previous}, previous)
+                self.assertEqual(tempfile.tempdir, previous_tempdir)
+
+    def test_work_dir_dry_run_wal_replica_and_cli(self):
+        with tempfile.TemporaryDirectory() as tmp, tempfile.TemporaryDirectory() as external:
+            vault, exclude, _, _ = fixture(Path(tmp))
+            work = Path(external)
+            with closing(sqlite3.connect(vault / 'structured/chat-archive.sqlite3')) as db:
+                db.execute('PRAGMA journal_mode=WAL')
+                db.execute("INSERT INTO build_metadata VALUES ('wal-fixture','PRIVATE WAL body')")
+                db.commit()
+                before = tree_state(vault)
+                original_copy = shutil.copyfile
+                destinations = []
+                def copy(source, target):
+                    self.assertTrue(target.is_relative_to(work))
+                    destinations.append(target)
+                    return original_copy(source, target)
+                with patch('purge_conversations.shutil.copyfile', side_effect=copy):
+                    plan = execute(vault, exclude, work_dir=work)
+                self.assertTrue(destinations)
+                self.assertEqual(tree_state(vault), before)
+                self.assertEqual(list(work.iterdir()), [])
+                result = subprocess.run([sys.executable, str(Path(__file__).parent / 'purge_conversations.py'),
+                                         '--vault', str(vault), '--exclude', str(exclude), '--work-dir', str(work)],
+                                        capture_output=True, text=True, check=True)
+                self.assertEqual(json.loads(result.stdout), plan)
+                self.assertNotIn('PRIVATE', result.stdout + result.stderr)
+                self.assertEqual(result.stderr, '')
+                self.assertEqual(tree_state(vault), before)
+                self.assertEqual(list(work.iterdir()), [])
+
     def test_superseded_sources_purged_by_table_and_message_conversation(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

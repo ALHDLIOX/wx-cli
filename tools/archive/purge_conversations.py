@@ -14,9 +14,11 @@ import os
 from pathlib import Path
 import re
 import shutil
+import signal
 import sqlite3
 import stat
 import subprocess
+import sys
 import tempfile
 
 from archive_state import atomic_json, file_lock
@@ -24,8 +26,99 @@ from build_archive import Decoder
 from exclusion import Ownership, chat_hash, ident, load_exclusions
 
 
+WORK_SPACE_MULTIPLIER = 2.5
+SPACE_RESERVE = 2 * 1024 ** 3
+
+
 class PurgeError(Exception):
     pass
+
+
+def progress(stage, path=None):
+    event = {'stage': stage, 'at': dt.datetime.now(dt.timezone.utc).isoformat()}
+    if path is not None:
+        event['path'] = str(path)
+    print(json.dumps(event), file=sys.stderr, flush=True)
+
+
+def validate_work_dir(path):
+    path = Path(path)
+    if not path.is_absolute():
+        raise PurgeError('work_dir_not_absolute')
+    try:
+        info = path.lstat()
+    except OSError:
+        raise PurgeError('work_dir_not_directory') from None
+    if stat.S_ISLNK(info.st_mode):
+        raise PurgeError('work_dir_symlink')
+    if not stat.S_ISDIR(info.st_mode):
+        raise PurgeError('work_dir_not_directory')
+    if info.st_uid != os.getuid():
+        raise PurgeError('work_dir_owner_mismatch')
+    if stat.S_IMODE(info.st_mode) & ~0o700:
+        raise PurgeError('work_dir_permissions')
+    return path
+
+
+@contextmanager
+def workspace(vault, work_dir, apply):
+    """Set SQLite's temporary location before even the planning connections."""
+    parent = validate_work_dir(work_dir) if work_dir is not None else vault
+    if work_dir is None and not apply:
+        yield None
+        return
+    if work_dir is None:
+        safe_path(vault, vault)
+    variables = ('SQLITE_TMPDIR', 'TMPDIR') if work_dir is not None else ('SQLITE_TMPDIR',)
+    previous = {name: os.environ.get(name) for name in variables}
+    previous_tempdir = tempfile.tempdir
+    work = Path(tempfile.mkdtemp(prefix='.purge-', dir=parent))
+    try:
+        work.chmod(0o700)
+        for name in variables:
+            os.environ[name] = str(work)
+        if work_dir is not None:
+            tempfile.tempdir = str(work)
+        yield work
+    finally:
+        for name, value in previous.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+        tempfile.tempdir = previous_tempdir
+        shutil.rmtree(work)
+
+
+def check_space(plan, work):
+    size = sum(changes.path.stat().st_size for changes in plan.databases)
+    if shutil.disk_usage(work).free <= size * WORK_SPACE_MULTIPLIER + SPACE_RESERVE:
+        raise PurgeError('insufficient_work_dir_space')
+    if shutil.disk_usage(plan.vault).free <= size + SPACE_RESERVE:
+        raise PurgeError('insufficient_vault_space')
+
+
+@contextmanager
+def vault_copy(source, destination):
+    """Keep every replacement on its destination filesystem, even metadata."""
+    expected = sha256(source)
+    fd, name = tempfile.mkstemp(prefix='.purge-', suffix='.tmp', dir=destination.parent)
+    target = Path(name)
+    try:
+        with os.fdopen(fd, 'wb') as output, source.open('rb') as stream:
+            shutil.copyfileobj(stream, output)
+            output.flush()
+            os.fsync(output.fileno())
+        directory = os.open(destination.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+        if sha256(target) != expected:
+            raise PurgeError('copy_back_hash_mismatch')
+        yield target
+    finally:
+        target.unlink(missing_ok=True)
 
 
 def signature(path):
@@ -504,7 +597,9 @@ def validate(db, fts=False):
         db.commit()
 
 
-def prepare_database(changes, target, now):
+def prepare_database(changes, target, now, log=None):
+    log = log or (lambda stage: None)
+    log('copy_database')
     with replica(changes.path) as src:
         dest = sqlite3.connect(target)
         try:
@@ -515,6 +610,7 @@ def prepare_database(changes, target, now):
     try:
         db.execute('PRAGMA journal_mode=DELETE')
         db.execute('PRAGMA foreign_keys=ON')
+        log('delete_rows')
         for temporary, values in changes.selections:
             db.execute('CREATE TEMP TABLE ' + temporary + '(value PRIMARY KEY)')
             db.executemany('INSERT INTO ' + temporary + ' VALUES (?)', ((value,) for value in values))
@@ -523,11 +619,15 @@ def prepare_database(changes, target, now):
             db.execute(sql, () if drop else args)
         is_archive = changes.path.name == 'chat-archive.sqlite3'
         if is_archive:
+            log('rebuild_fts')
             db.execute("INSERT INTO message_search(message_search) VALUES('rebuild')")
             refresh_metadata(db, changes.counts, now)
         db.commit()
+        log('validate_database')
         validate(db, is_archive)
+        log('vacuum')
         db.execute('VACUUM')
+        log('validate_database')
         validate(db, is_archive)
     finally:
         db.close()
@@ -667,13 +767,19 @@ def prepare_snapshot(snapshot, counts, now, old_hashes, staged_paths, removed_pa
     return result
 
 
-def execute(vault, exclude, apply=False, confirm=None, process_runner=None):
+def execute(vault, exclude, apply=False, confirm=None, process_runner=None, work_dir=None):
     vault = Path(vault).absolute()
+    if apply and os.geteuid() != 0:
+        raise PurgeError('root_required')
+    with workspace(vault, work_dir, apply) as work:
+        return execute_in_workspace(vault, exclude, apply, confirm, process_runner, work,
+                                    external_work=work_dir is not None)
+
+
+def execute_in_workspace(vault, exclude, apply, confirm, process_runner, work, external_work):
     if not apply:
         plan = make_plan(vault, exclude)
         return dict(plan.summary(), dry_run=True, plan_digest=plan.digest())
-    if os.geteuid() != 0:
-        raise PurgeError('root_required')
     with ExitStack() as locks:
         safe_path(vault, vault / 'structured/chat-archive.sqlite3.ingest.lock')
         safe_path(vault, vault / 'media-links.sqlite3.lock')
@@ -686,6 +792,8 @@ def execute(vault, exclude, apply=False, confirm=None, process_runner=None):
         digest = plan.digest()
         if not confirm or confirm != digest:
             raise PurgeError('plan_digest_mismatch')
+        if external_work:
+            check_space(plan, work)
         now = dt.datetime.now(dt.timezone.utc).isoformat(timespec='microseconds')
         report = dict(plan.summary(), dry_run=False, plan_digest=digest, at=now)
         old_hashes = {snapshot: {str(path.relative_to(snapshot)): sha256(path)
@@ -694,11 +802,13 @@ def execute(vault, exclude, apply=False, confirm=None, process_runner=None):
         # Stage and validate every database and manifest before publishing any change.
         metadata = {snapshot: read_snapshot_metadata(vault, snapshot)
                     for snapshot in plan.snapshots}
-        with tempfile.TemporaryDirectory(prefix='.purge-', dir=vault) as work:
+        with ExitStack() as copies:
             staged = []
             for number, changes in enumerate(plan.databases):
                 target = Path(work) / str(number)
-                prepare_database(changes, target, now)
+                relative = changes.path.relative_to(vault)
+                progress('prepare_database', relative)
+                prepare_database(changes, target, now, lambda stage: progress(stage, relative))
                 staged.append((changes, target))
             staged_paths = {changes.path: target for changes, target in staged}
             staged_metadata = []
@@ -713,20 +823,34 @@ def execute(vault, exclude, apply=False, confirm=None, process_runner=None):
                     target = Path(work) / (str(number) + '-' + name)
                     atomic_json(target, value)
                     staged_metadata.append((snapshot / name, target))
+            if external_work:
+                local_databases = []
+                for changes, target in staged:
+                    progress('copy_back', changes.path.relative_to(vault))
+                    local_databases.append((changes, copies.enter_context(vault_copy(target, changes.path))))
+                local_metadata = []
+                for path, target in staged_metadata:
+                    progress('copy_back', path.relative_to(vault))
+                    local_metadata.append((path, copies.enter_context(vault_copy(target, path))))
+                staged, staged_metadata = local_databases, local_metadata
             running_workers(vault, process_runner)
             # Reject changes during preparation; the two locks exclude ingest/link.
             if any(not Path(path).exists() or signature(Path(path)) != tuple(value)
                    for path, value in plan.observed.items()):
                 raise PurgeError('vault_changed_during_purge')
             for changes, target in staged:
+                progress('publish_database', changes.path.relative_to(vault))
                 os.replace(target, changes.path)
                 for suffix in ('-wal', '-shm'):
                     sidecar = Path(str(changes.path) + suffix)
                     safe_path(vault, sidecar)
                     sidecar.unlink(missing_ok=True)
             for path in sorted(plan.files):
+                # Media filenames can contain names from the exclusion list.
+                progress('delete_media')
                 path.unlink()
             for path, target in staged_metadata:
+                progress('publish_metadata', path.relative_to(vault))
                 os.replace(target, path)
         for root in (vault / 'media/msg', vault / 'decoded'):
             if root.exists():
@@ -744,6 +868,7 @@ def execute(vault, exclude, apply=False, confirm=None, process_runner=None):
         report['released_bytes'] = released
         stamp = dt.datetime.now(dt.timezone.utc).strftime('%Y%m%dT%H%M%S%fZ')
         report_path = vault / ('purge-' + stamp + '.json')
+        progress('write_report')
         atomic_json(report_path, report)
         return dict(report, report_path=str(report_path))
 
@@ -754,14 +879,22 @@ def main():
     parser.add_argument('--exclude', type=Path, required=True)
     parser.add_argument('--apply', action='store_true')
     parser.add_argument('--confirm')
+    parser.add_argument('--work-dir', type=Path,
+                        help='existing private directory for database preparation and SQLite temporary files')
     args = parser.parse_args()
+    # SIGINT already raises KeyboardInterrupt; make SIGTERM unwind the same finally blocks.
+    def interrupted(signum, frame):
+        raise SystemExit(128 + signum)
+    previous_handler = signal.signal(signal.SIGTERM, interrupted)
     try:
-        result = execute(args.vault, args.exclude, args.apply, args.confirm)
+        result = execute(args.vault, args.exclude, args.apply, args.confirm, work_dir=args.work_dir)
     except Exception as error:
         # Never print SQLite/JSON/OS exception text, which may contain private data.
         code = str(error) if isinstance(error, PurgeError) else type(error).__name__
         print(json.dumps({'error': code}))
         return 1
+    finally:
+        signal.signal(signal.SIGTERM, previous_handler)
     print(json.dumps(result, ensure_ascii=False, indent=2))
     return 0
 
