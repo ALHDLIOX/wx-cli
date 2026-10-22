@@ -261,8 +261,15 @@ apply 会拒绝正在运行的 `decode_media.py`、`convert_wxgf.py`、`index_me
 
 快照中的 `message/message_fts.db` 使用 NAS 无法加载的 `MMFtsTokenizer`，因此整文件删除；
 其内容在构建归档时已保存在 `index_evidence`，清除时仅移除其中排除会话的证据。
-更新快照 `manifest.json`、`verified.json` 中已有哈希，移除已删除 FTS 的文件项，并写入
-完整 `database_hashes` 及仅含计数和时间的 `purged` 字段。
+快照 `manifest.json` 支持对象和列表两种格式。列表保持原格式，按相对 `databases/` 的
+`path` 更新各项 `bytes`、`sha256`，移除已删除 FTS 的文件项；缺少必需字段、字段类型
+错误或路径无效时，以 `invalid_snapshot_manifest` 拒绝执行。列表格式的完整
+`database_hashes` 和仅含时间、计数的 `purged: {at, counts}` 写入同目录 `purge.json`
+（`0600`，原子写入）；对象格式仍在 manifest 内更新已有哈希并写入这两个字段。
+`verified.json` 保持对象格式，更新 `files` 为清除后 manifest 项数、`bytes` 为字节总和，
+写入 `database_hashes`、`purged`，并按实际数据库哈希与新 manifest 的比较结果重新计算
+`sha256_all_match`，保留其余字段。所有数据库与这些元数据均先暂存并完成校验，再发布
+任何修改；元数据文件逐个原子替换。
 
 媒体清除复用上述归属规则，同时清理 `media_files`、`decoded-media.sqlite3` 和链接库记录，
 删除对应 decoded 输出及空目录。已核对三个解码脚本：decoded 的 `path` 相对 `media/msg`，

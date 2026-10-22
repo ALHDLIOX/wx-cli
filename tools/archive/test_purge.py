@@ -161,6 +161,23 @@ CREATE TABLE FtsDeleteInfo(session_id INTEGER);
     return vault, exclude, snap, excluded_ids
 
 
+def list_manifest_fixture(root):
+    vault, exclude, snap, removed_ids = fixture(root)
+    source = snap / 'databases'
+    # Match the deployed 30-file snapshot and exercise untouched databases too.
+    for number in range(30 - len(list(source.rglob('*.db')))):
+        with closing(database(source / 'other' / f'retained_{number}.db',
+                              'CREATE TABLE retained(value TEXT);')):
+            pass
+    manifest = [{'path': str(path.relative_to(source)), 'bytes': path.stat().st_size,
+                 'sha256': sha256(path)} for path in sorted(source.rglob('*.db'))]
+    atomic_json(snap / 'manifest.json', manifest)
+    atomic_json(snap / 'verified.json', {'files': len(manifest),
+                'bytes': sum(entry['bytes'] for entry in manifest),
+                'sha256_all_match': False, 'at': 123.5, 'extra': 'retained'})
+    return vault, exclude, snap, removed_ids
+
+
 def no_process(command, **kwargs):
     return subprocess.CompletedProcess(command, 1)
 
@@ -302,6 +319,89 @@ CREATE TABLE chatroom_member(room_id INTEGER,member_id INTEGER);
                     self.assertEqual(db.execute('PRAGMA quick_check').fetchall(), [('ok',)])
                     self.assertEqual(db.execute('PRAGMA freelist_count').fetchone()[0], 0)
             self.assertFalse(list(vault.glob('.purge-*')))
+
+    def test_apply_list_manifest(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            vault, exclude, snap, _ = list_manifest_fixture(Path(tmp))
+            digest = execute(vault, exclude)['plan_digest']
+            with patch('purge_conversations.os.geteuid', return_value=0):
+                execute(vault, exclude, True, digest, no_process)
+            manifest = json.loads((snap / 'manifest.json').read_text())
+            self.assertIsInstance(manifest, list)
+            self.assertEqual(len(manifest), 29)
+            self.assertNotIn('message/message_fts.db', [entry['path'] for entry in manifest])
+            for entry in manifest:
+                path = snap / 'databases' / entry['path']
+                self.assertEqual(entry['sha256'], sha256(path))
+                self.assertEqual(entry['bytes'], path.stat().st_size)
+            audit_path = snap / 'purge.json'
+            self.assertEqual(audit_path.stat().st_mode & 0o777, 0o600)
+            audit = json.loads(audit_path.read_text())
+            self.assertEqual(set(audit), {'database_hashes', 'purged'})
+            self.assertEqual(set(audit['purged']), {'at', 'counts'})
+            self.assertEqual(audit['purged']['counts']['databases/message/message_fts.db']['files'], 1)
+            for rel, item in audit['database_hashes'].items():
+                self.assertEqual(item, {'bytes': (snap / rel).stat().st_size, 'sha256': sha256(snap / rel)})
+            verified = json.loads((snap / 'verified.json').read_text())
+            self.assertEqual(verified['files'], len(manifest))
+            self.assertEqual(verified['bytes'], sum(entry['bytes'] for entry in manifest))
+            self.assertTrue(verified['sha256_all_match'])
+            self.assertEqual(verified['purged'], audit['purged'])
+            self.assertEqual(verified['at'], 123.5)
+            self.assertEqual(verified['extra'], 'retained')
+
+    def test_invalid_list_manifest_changes_no_data(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            vault, exclude, snap, _ = list_manifest_fixture(Path(tmp))
+            valid = json.loads((snap / 'manifest.json').read_text())
+            entry = valid[0]
+            invalid = [None, [], 'invalid']
+            for key in ('path', 'bytes', 'sha256'):
+                invalid.append({k: v for k, v in entry.items() if k != key})
+                for value in (None, True, [], {}):
+                    invalid.append(dict(entry, **{key: value}))
+            invalid.extend([dict(entry, path=123), dict(entry, path='../outside.db'),
+                            dict(entry, path='missing.db'), dict(entry, bytes='123'),
+                            dict(entry, bytes=1.5), dict(entry, bytes=-1),
+                            dict(entry, sha256=123), dict(entry, sha256='not-a-hash')])
+            # Lock creation is independent of snapshot publication.
+            for lock in ('structured/chat-archive.sqlite3.ingest.lock', 'media-links.sqlite3.lock', 'media-transfer.lock'):
+                with file_lock(vault / lock):
+                    pass
+            for bad in invalid:
+                with self.subTest(entry=bad):
+                    atomic_json(snap / 'manifest.json', [bad] + valid[1:])
+                    digest = execute(vault, exclude)['plan_digest']
+                    before = tree_state(vault)
+                    with patch('purge_conversations.os.geteuid', return_value=0):
+                        with self.assertRaisesRegex(PurgeError, '^invalid_snapshot_manifest$'):
+                            execute(vault, exclude, True, digest, no_process)
+                    self.assertEqual(tree_state(vault), before)
+
+    def test_list_verification_recomputed_for_incomplete_manifest(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            vault, exclude, snap, _ = list_manifest_fixture(Path(tmp))
+            manifest = json.loads((snap / 'manifest.json').read_text())
+            atomic_json(snap / 'manifest.json', manifest[1:])
+            atomic_json(snap / 'verified.json', {'sha256_all_match': True, 'at': 123.5})
+            digest = execute(vault, exclude)['plan_digest']
+            with patch('purge_conversations.os.geteuid', return_value=0):
+                execute(vault, exclude, True, digest, no_process)
+            self.assertFalse(json.loads((snap / 'verified.json').read_text())['sha256_all_match'])
+
+    def test_metadata_stage_failure_changes_no_data(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            vault, exclude, _, _ = list_manifest_fixture(Path(tmp))
+            for lock in ('structured/chat-archive.sqlite3.ingest.lock', 'media-links.sqlite3.lock', 'media-transfer.lock'):
+                with file_lock(vault / lock):
+                    pass
+            digest = execute(vault, exclude)['plan_digest']
+            before = tree_state(vault)
+            with patch('purge_conversations.os.geteuid', return_value=0):
+                with patch('purge_conversations.atomic_json', side_effect=OSError('stage failed')):
+                    with self.assertRaises(OSError):
+                        execute(vault, exclude, True, digest, no_process)
+            self.assertEqual(tree_state(vault), before)
 
     def test_changed_digest_rejected_without_deletions(self):
         with tempfile.TemporaryDirectory() as tmp:
