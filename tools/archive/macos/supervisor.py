@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """One persistent process for Mac-side archive access."""
 import json
+import logging
 import os
 from pathlib import Path
 import sys
@@ -19,6 +20,17 @@ def repeat(interval, action):
         time.sleep(max(5, interval - (time.time() - started)))
 
 
+def text_cycle(root):
+    import sync_incremental
+    try:
+        return sync_incremental.cycle(root)
+    except Exception:
+        try:
+            sync_incremental.send_status(root)
+        except Exception as error:
+            logging.warning('Text worker status transfer failed: %s', type(error).__name__)
+
+
 def main(root=None):
     root = Path(root) if root is not None else Path.home() / '.wx-cli/nas-archive'
     os.umask(0o077)
@@ -26,10 +38,9 @@ def main(root=None):
     sys.path.insert(0, str(Path(config['repository']) / 'tools/archive'))
     from archive_state import atomic_json, file_lock
     import recent_media
-    import sync_incremental
     from macos import media_cycle
     with file_lock(root / 'supervisor.lock'):
-        for interval, action in [(60, lambda: sync_incremental.cycle(root)),
+        for interval, action in [(60, lambda: text_cycle(root)),
                                  (60, lambda: recent_media.main(root)),
                                  (900, lambda: media_cycle.run(root))]:
             threading.Thread(target=repeat, args=(interval, action), daemon=True).start()

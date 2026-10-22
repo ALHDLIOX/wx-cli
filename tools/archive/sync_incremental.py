@@ -6,6 +6,7 @@ import gzip
 import hashlib
 import importlib.util
 import json
+import logging
 import os
 from pathlib import Path
 import re
@@ -13,8 +14,30 @@ import sqlite3
 import subprocess
 import time
 
-from archive_state import atomic_bytes, file_lock, mac_status, read_status, worker_cycle
+from archive_state import atomic_bytes, atomic_json, file_lock, mac_status, read_status, worker_cycle
 from exclusion import Ownership, load_exclusions, tokens
+
+ROWID_ROLLBACK_LIMIT = 1000
+INGEST_COMMAND = ['ssh', '-o', 'ConnectTimeout=10', '-o', 'ServerAliveInterval=15',
+                  '-o', 'ServerAliveCountMax=3', 'NAS',
+                  'python3 /pool-safe/wechat-vault/tools/ingest_delta.py /pool-safe/wechat-vault/structured/chat-archive.sqlite3']
+
+
+def send_packet(packet):
+    payload = gzip.compress(json.dumps(packet, ensure_ascii=False).encode())
+    return transfer(payload)
+
+
+def transfer(payload):
+    return subprocess.run(INGEST_COMMAND, input=payload, capture_output=True,
+                          timeout=900, check=True)
+
+
+def send_status(root):
+    state = json.loads((root / 'state.json').read_text())
+    running = read_status(root / 'incremental-status.json').get('wechat_running')
+    return send_packet({'self_user': state['self_user'], 'rows': [], 'resource_refs': [],
+                        'mac_status': mac_status(root, running)})
 
 
 def source_class():
@@ -52,6 +75,7 @@ def collect_and_send(root, state, home, keys, Source, dbdir, snapshot, c, exclud
     c.execute('CREATE TABLE IF NOT EXISTS cursors(db TEXT,tbl TEXT,cursor INTEGER,salt TEXT,PRIMARY KEY(db,tbl))')
     c.execute('CREATE TABLE IF NOT EXISTS seen(db TEXT,tbl TEXT,rid INTEGER,hash TEXT,PRIMARY KEY(db,tbl,rid))')
     sources, maps, rows, nexts = {}, {}, [], []
+    diagnostics = {'blocked_tables': 0, 'rowid_rollbacks': 0}
     try:
         files = sorted(p for p in (dbdir / 'message').glob('*.db')
                        if re.fullmatch(r'(?:biz_)?message_\d+\.db', p.name))
@@ -83,7 +107,13 @@ def collect_and_send(root, state, home, keys, Source, dbdir, snapshot, c, exclud
                         cursor = 0
                     high = src.rows(f'SELECT max(rowid) FROM "{table}"')[0][0] or 0
                     if high < cursor:
-                        raise RuntimeError('source_rowids_reset')
+                        if high == 0 or cursor - high > ROWID_ROLLBACK_LIMIT:
+                            diagnostics['blocked_tables'] += 1
+                            logging.warning('source_rowids_reset: skipping db=%s table=%s (cursor=%d high=%d)',
+                                            rel, table, cursor, high)
+                            continue
+                        cursor = high
+                        diagnostics['rowid_rollbacks'] += 1
                     fetched = src.rows(f'SELECT rowid,local_id,server_id,local_type,sort_seq,real_sender_id,create_time,hex(message_content),WCDB_CT_message_content FROM "{table}" WHERE rowid>{max(0, cursor-8)} ORDER BY rowid LIMIT 1000')
                     for rid, local, server, kind, seq, sender, stamp, raw, compression in fetched:
                         if table not in names:
@@ -99,6 +129,11 @@ def collect_and_send(root, state, home, keys, Source, dbdir, snapshot, c, exclud
     finally:
         for source in sources.values():
             source.close()
+    # Publish completed table diagnostics even if resource collection/transfer fails.
+    status_path = root / 'incremental-status.json'
+    status = read_status(status_path)
+    status.update(diagnostics)
+    atomic_json(status_path, status)
     changed, seen = [], []
     for row in rows:
         fingerprint = hashlib.sha256(json.dumps(row, sort_keys=True).encode()).hexdigest()
@@ -133,10 +168,7 @@ def collect_and_send(root, state, home, keys, Source, dbdir, snapshot, c, exclud
     payload = gzip.compress(json.dumps(packet, ensure_ascii=False).encode())
     pending = root / 'incremental-pending.json.gz'
     atomic_bytes(pending, payload)
-    result = subprocess.run(['ssh', '-o', 'ConnectTimeout=10', '-o', 'ServerAliveInterval=15',
-                             '-o', 'ServerAliveCountMax=3', 'NAS',
-                             'python3 /pool-safe/wechat-vault/tools/ingest_delta.py /pool-safe/wechat-vault/structured/chat-archive.sqlite3'],
-                            input=payload, capture_output=True, timeout=900, check=True)
+    result = transfer(payload)
     report = json.loads(result.stdout)
     with c:
         c.executemany('INSERT OR REPLACE INTO cursors VALUES (?,?,?,?)', nexts)
@@ -144,7 +176,7 @@ def collect_and_send(root, state, home, keys, Source, dbdir, snapshot, c, exclud
         if resource_next is not None:
             c.execute('INSERT OR REPLACE INTO resource_cursor VALUES (1,?)', (resource_next,))
     pending.unlink()
-    report.update(rows_checked=len(rows), rows_sent=len(changed), shards=len(sources))
+    report.update(rows_checked=len(rows), rows_sent=len(changed), shards=len(sources), **diagnostics)
     return report
 
 

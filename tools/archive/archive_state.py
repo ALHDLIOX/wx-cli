@@ -73,6 +73,9 @@ def worker_cycle(root, name, action, extra=None):
     try:
         result = dict(action() or {})
     except Exception as error:
+        diagnostics = read_status(path)
+        base.update({key: diagnostics[key] for key in ('blocked_tables', 'rowid_rollbacks')
+                     if key in diagnostics})
         result = dict(base, stage='error', checked_at=time.time(),
                       consecutive_errors=base['consecutive_errors'] + 1,
                       duration_seconds=time.time() - started)
@@ -96,4 +99,6 @@ def mac_status(root, wechat_running):
         status = read_status(root / filename)
         # Never copy arbitrary worker result fields into the heartbeat.
         workers[name] = {key: status.get(key) for key in SUMMARY_FIELDS}
-    return {'workers': workers, 'wechat_running': wechat_running}
+    status = read_status(root / STATUS_FILES['incremental'])
+    return {'workers': workers, 'wechat_running': wechat_running,
+            **{key: status.get(key) for key in ('blocked_tables', 'rowid_rollbacks')}}

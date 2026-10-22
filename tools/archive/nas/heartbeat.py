@@ -43,6 +43,12 @@ def evaluate(heartbeat, previous, config, now):
         desired['stale'] = {'since': since, 'label': 'Mac 同步',
                             'text': f'Mac 同步已中断 {math.floor((now-since)/60)} 分钟（可能睡眠、断网或 app 停止）'}
     mac = heartbeat.get('mac_status') or {}
+    blocked = mac.get('blocked_tables')
+    if isinstance(blocked, int) and blocked > 0:
+        desired['blocked_tables'] = {'since': now, 'label': '消息表同步',
+                                     'text': f'有 {blocked} 张消息表因行号异常暂停同步'}
+    elif blocked is None and 'blocked_tables' in active:
+        desired['blocked_tables'] = active['blocked_tables']
     if mac.get('wechat_running') is False:
         desired['wechat'] = {'since': now, 'label': 'Mac 上微信', 'text': 'Mac 上微信未运行'}
     elif mac.get('wechat_running') is not True and 'wechat' in active:
